@@ -16,7 +16,8 @@ b站： https://b23.tv/24zTirI
 - 但核心AI和语音生成完全重新实现，更加智能
 
 **使用方法**
-去火山引擎注册账号，免费申请一个豆包1.6lite的api，然后去 https://www.vocu.ai 注册一个账号，在assests/audio文件夹挑一个时间稍长的语音复刻一个克里斯蒂娜音频复制角色id，然后申请一个api，到软件设置中填入即可
+去火山引擎注册账号，免费申请一个豆包1.6lite的api，然后去： https://www.vocu.ai 
+注册一个账号，在assests/audio文件夹挑一个时间稍长的语音复刻一个克里斯蒂娜音频复制角色id，然后申请一个api，到软件设置中填入即可
 
 我复刻的克里斯蒂娜音频还在审核中，审核完后你们应该可以直接套用我的结果
 <img width="356" height="249" alt="fcf5478d-3041-4c38-a0fd-24ed0f2eec8b" src="https://github.com/user-attachments/assets/824c4915-b296-41c5-a751-dd20e99caf8b" />
