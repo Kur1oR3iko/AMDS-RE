@@ -1,6 +1,8 @@
 # AMDS-RE (Amadeus) 项目说明
 未来装置研究所最新力作，爱来自Kurio
 b站： https://b23.tv/24zTirI
+<img width="1214" height="854" alt="e7679063-aa0c-4ab3-a959-b3983a75b161" src="https://github.com/user-attachments/assets/a143c6f8-13c6-4c87-b79b-6e1e9d3ecb78" />
+
 
 ## 项目来源
 
@@ -31,6 +33,8 @@ b站： https://b23.tv/24zTirI
 - **API密钥管理**：首次运行时输入，后续自动保存到本地
 - **音频模式切换**：可以开启/关闭语音模式
 - **tokens管理**：用于调用豆包API输出的文本大小，会影响到对话的长度、速度、完整性以及音频生成的时间
+<img width="563" height="548" alt="d36d37d8-fac3-45e3-b30f-9e37e7057c80" src="https://github.com/user-attachments/assets/36b09b9a-fdad-4bab-b556-e36d6f3f173a" />
+
 
 ### 📦 打包系统
 - **单文件EXE**：写了个py脚本，应该可以一键打包为exe文件，也就是说你可以在修改完代码后直接运行这个脚本，就可以打包出一个新的exe文件
