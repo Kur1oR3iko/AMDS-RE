@@ -1,7 +1,7 @@
 """
 Amadeus Desktop - Python移植版本
 基于原始Android APK: com.example.yink.amadeus v0.9.6-alpha.5
-当前版本: v0.0.2
+当前版本: v0.0.3
 """
 
 import sys
