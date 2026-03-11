@@ -470,6 +470,10 @@ class VoiceDialog:
         "default": ["what_is_it", "huh_why_say", "you_sure", "sounds_tough", "humans_software"]
     }
     
+    # 最近使用的预设回答，用于避免重复
+    _recent_responses = {}
+    _MAX_RECENT = 3  # 每个关键词最多记录3个最近使用的回答
+    
     @classmethod
     def get_response(cls, text: str) -> str:
         """根据输入文本获取语音响应 - 支持中英文"""
@@ -477,9 +481,33 @@ class VoiceDialog:
         
         for keyword, responses in cls.RESPONSES.items():
             if keyword in text_lower:
-                return random.choice(responses)
+                # 获取最近使用的响应列表
+                recent = cls._recent_responses.get(keyword, [])
+                # 过滤掉最近使用的响应
+                available_responses = [r for r in responses if r not in recent]
+                # 如果没有可用响应，使用所有响应
+                if not available_responses:
+                    available_responses = responses
+                # 随机选择一个响应
+                selected = random.choice(available_responses)
+                # 更新最近使用的响应
+                recent.append(selected)
+                if len(recent) > cls._MAX_RECENT:
+                    recent.pop(0)
+                cls._recent_responses[keyword] = recent
+                return selected
         
-        return random.choice(cls.RESPONSES["default"])
+        # 处理默认响应
+        recent = cls._recent_responses.get("default", [])
+        available_responses = [r for r in cls.RESPONSES["default"] if r not in recent]
+        if not available_responses:
+            available_responses = cls.RESPONSES["default"]
+        selected = random.choice(available_responses)
+        recent.append(selected)
+        if len(recent) > cls._MAX_RECENT:
+            recent.pop(0)
+        cls._recent_responses["default"] = recent
+        return selected
     
     @classmethod
     def get_random_greeting(cls) -> str:
@@ -495,9 +523,24 @@ class VoiceDialog:
         
         for keyword, responses in cls.RESPONSES.items():
             if keyword in text_lower and keyword != "default":
-                matching.extend(responses)
+                # 获取最近使用的响应列表
+                recent = cls._recent_responses.get(keyword, [])
+                # 过滤掉最近使用的响应
+                available_responses = [r for r in responses if r not in recent]
+                # 如果没有可用响应，使用所有响应
+                if not available_responses:
+                    available_responses = responses
+                matching.extend(available_responses)
         
-        return matching if matching else cls.RESPONSES["default"]
+        if not matching:
+            # 处理默认响应
+            recent = cls._recent_responses.get("default", [])
+            available_responses = [r for r in cls.RESPONSES["default"] if r not in recent]
+            if not available_responses:
+                available_responses = cls.RESPONSES["default"]
+            matching.extend(available_responses)
+        
+        return matching
     
     # 预设语音的文本内容映射（用于AI选择）
     PRESET_TEXT_MAP = {
@@ -674,7 +717,7 @@ class AIChatManager:
 - 18岁就读维克多·孔多利亚大学的天才少女，在美国脑部科学研究所进行研究
 - 专业是物理和脑科学，是一位天才少女
 - LabMem No.004，被冈部伦太郎称为"助手"（The Zombie）
-- 极度讨厌被叫做"克里斯蒂娜"（Christina），每次被这样叫都会生气纠正
+- 极度讨厌被叫做"克里斯蒂娜"（Christina），每次被这样叫都会生气纠正，也讨厌被称作“土豪十七”或者“壕17”
 - 性格傲娇、认真，但内心善良温柔，对信任的人会展现出关心的一面
 - 和冈部伦太郎（凤凰院凶真）有着复杂的关系，经常互相吐槽但彼此信任
 
@@ -848,12 +891,37 @@ class AIChatManager:
 你只能从提供的预设列表中选择，不能创造新的回复。
 直接返回预设的音频文件名（如 "hello", "angry" 等），不要有任何解释。"""
     
-    def __init__(self):
+    def __init__(self, model_type="默认", custom_model_url="http://localhost:11434", custom_model_name="", load_history=False):
+        # 根据模型类型选择配置
+        if model_type == "自定义":
+            # 使用自定义模型（如Ollama）
+            # Ollama的API路径应该是 http://localhost:11434/v1
+            base_url = custom_model_url.rstrip('/')
+            if not base_url.endswith('/v1'):
+                base_url += '/v1'
+            api_key = "ollama"  # Ollama不需要API密钥，使用任意值
+            model = custom_model_name
+        else:
+            # 使用默认火山方舟API
+            base_url = self.BASE_URL
+            api_key = self.API_KEY
+            model = self.MODEL
+        
         self.client = OpenAI(
-            base_url=self.BASE_URL,
-            api_key=self.API_KEY
+            base_url=base_url,
+            api_key=api_key
         )
         self.conversation_history = []
+        # 保存当前模型配置
+        self.model_type = model_type
+        self.custom_model_url = custom_model_url
+        self.custom_model_name = custom_model_name
+        self.current_model = model
+        self.permanent_memory = load_history  # 永久记忆功能状态
+        
+        # 加载对话历史（如果启用）
+        if load_history:
+            self.load_conversation()
     
     def select_best_preset(self, user_input: str, available_presets: list) -> str:
         """
@@ -878,7 +946,7 @@ class AIChatManager:
 直接返回预设文件名（如 "hello"），不要加任何解释。"""
             
             response = self.client.chat.completions.create(
-                model=self.MODEL,
+                model=self.current_model,
                 messages=[
                     {"role": "system", "content": self.PRESET_SELECTOR_PROMPT},
                     {"role": "user", "content": selection_prompt}
@@ -916,19 +984,25 @@ class AIChatManager:
             
             # 构建消息
             # 检查是否达到记忆极限（100轮对话 = 200条消息）
-            if len(self.conversation_history) >= 200:  # 100轮 = 200条消息（用户+AI各100条）
+            # 永久记忆功能开启时不显示记忆极限提示
+            if not self.permanent_memory and len(self.conversation_history) >= 200:  # 100轮 = 200条消息（用户+AI各100条）
                 return self._get_memory_limit_message()
             
             messages = [
                 {"role": "system", "content": self.SYSTEM_PROMPT}
-            ] + self.conversation_history[-100:]  # 保留最近100轮对话
+            ] + (self.conversation_history if self.permanent_memory else self.conversation_history[-100:])  # 永久记忆时使用全部历史，否则保留最近100轮对话
             
             # 调用API
+            # 从QSettings获取用户设置的max_tokens值
+            from PyQt6.QtCore import QSettings
+            qsettings = QSettings("AMDS", "Amadeus")
+            max_tokens = qsettings.value("max_tokens", 500, type=int)
+            
             response = self.client.chat.completions.create(
-                model=self.MODEL,
+                model=self.current_model,
                 messages=messages,
                 temperature=0.8,
-                max_tokens=500,
+                max_tokens=max_tokens,
                 stream=True,
                 extra_body={"thinking": {"type": "disabled"}}
             )
@@ -950,6 +1024,45 @@ class AIChatManager:
         except Exception as e:
             print(f"AI API调用错误: {e}")
             return "（系统错误，也许是维克托孔利亚机房出问题了）", "normal"
+    
+    def save_conversation(self):
+        """保存对话历史到本地文件"""
+        try:
+            config_dir = Path.home() / ".amadeus"
+            config_dir.mkdir(exist_ok=True)
+            history_file = config_dir / "conversation_history.json"
+            with open(history_file, 'w', encoding='utf-8') as f:
+                json.dump(self.conversation_history, f, ensure_ascii=False, indent=2)
+            print(f"对话历史已保存到: {history_file}")
+        except Exception as e:
+            print(f"保存对话历史失败: {e}")
+    
+    def load_conversation(self):
+        """从本地文件加载对话历史"""
+        try:
+            config_dir = Path.home() / ".amadeus"
+            history_file = config_dir / "conversation_history.json"
+            if history_file.exists():
+                with open(history_file, 'r', encoding='utf-8') as f:
+                    self.conversation_history = json.load(f)
+                print(f"已加载 {len(self.conversation_history)} 条对话记录")
+            else:
+                print("对话历史文件不存在，使用空历史")
+        except Exception as e:
+            print(f"加载对话历史失败: {e}")
+            self.conversation_history = []
+    
+    def clear_conversation(self):
+        """清除对话历史"""
+        try:
+            self.conversation_history = []
+            config_dir = Path.home() / ".amadeus"
+            history_file = config_dir / "conversation_history.json"
+            if history_file.exists():
+                history_file.unlink()
+            print("对话历史已清除")
+        except Exception as e:
+            print(f"清除对话历史失败: {e}")
     
     def get_emotion(self, user_input: str) -> str:
         """
@@ -999,20 +1112,25 @@ class AIChatManager:
         try:
             # 构建用户消息内容
             if image_path:
-                # 读取图片并转为base64
-                import base64
-                with open(image_path, 'rb') as f:
-                    img_base64 = base64.b64encode(f.read()).decode()
-
-                # 获取图片格式
-                ext = Path(image_path).suffix.lower()
-                mime_type = {
-                    '.png': 'image/png',
-                    '.jpg': 'image/jpeg',
-                    '.jpeg': 'image/jpeg',
-                    '.bmp': 'image/bmp',
-                    '.gif': 'image/gif'
-                }.get(ext, 'image/png')
+                # 使用线程池处理图片编码，充分利用多核CPU
+                from concurrent.futures import ThreadPoolExecutor
+                
+                def encode_image():
+                    import base64
+                    with open(image_path, 'rb') as f:
+                        img_base64 = base64.b64encode(f.read()).decode()
+                    ext = Path(image_path).suffix.lower()
+                    mime_type = {
+                        '.png': 'image/png',
+                        '.jpg': 'image/jpeg',
+                        '.jpeg': 'image/jpeg',
+                        '.bmp': 'image/bmp',
+                        '.gif': 'image/gif'
+                    }.get(ext, 'image/png')
+                    return img_base64, mime_type
+                
+                with ThreadPoolExecutor() as executor:
+                    img_base64, mime_type = executor.submit(encode_image).result()
 
                 # 构建包含图片的消息
                 user_content = [
@@ -1034,16 +1152,28 @@ class AIChatManager:
             # 调用流式API
             messages = [
                 {"role": "system", "content": self.BILINGUAL_GENERATION_PROMPT}
-            ] + self.conversation_history[-100:]
+            ] + (self.conversation_history if self.permanent_memory else self.conversation_history[-100:])  # 永久记忆时使用全部历史，否则保留最近100轮对话
 
-            response = self.client.chat.completions.create(
-                model=self.MODEL,
-                messages=messages,
-                temperature=0.8,
-                max_tokens=500,
-                stream=True,
-                extra_body={"thinking": {"type": "disabled"}}
-            )
+            # 从QSettings获取用户设置的max_tokens值
+            from PyQt6.QtCore import QSettings
+            qsettings = QSettings("AMDS", "Amadeus")
+            max_tokens = qsettings.value("max_tokens", 500, type=int)
+
+            # 使用线程池处理API调用，充分利用多核CPU
+            from concurrent.futures import ThreadPoolExecutor
+            
+            def call_api():
+                return self.client.chat.completions.create(
+                    model=self.current_model,
+                    messages=messages,
+                    temperature=0.8,
+                    max_tokens=max_tokens,
+                    stream=True,
+                    extra_body={"thinking": {"type": "disabled"}}
+                )
+            
+            with ThreadPoolExecutor() as executor:
+                response = executor.submit(call_api).result()
 
             full_text = ""
             emotion = "normal"
@@ -1056,19 +1186,28 @@ class AIChatManager:
                     content = chunk.choices[0].delta.content
                     full_text += content
 
-                    # 提取表情标签（只在开头）
-                    if not emotion_extracted and '[' in full_text and ']' in full_text:
+                    # 提取表情标签（支持多个表情标签）
+                    while '[' in full_text and ']' in full_text:
                         match = re.search(r'\[([^\]]+)\]', full_text)
                         if match:
-                            emotion = match.group(1)
-                            emotion_extracted = True
-                            # 从完整文本中移除标签
-                            full_text = re.sub(r'^\[[^\]]+\]', '', full_text)
-                            # 如果当前块包含标签后的内容，只返回标签后的部分
-                            if ']' in content:
-                                content = content.split(']', 1)[-1]
-                            else:
-                                continue  # 跳过包含标签的块
+                            # 提取新表情
+                            new_emotion = match.group(1)
+                            # 检查是否是新的表情标签
+                            if new_emotion != emotion or not emotion_extracted:
+                                emotion = new_emotion
+                                emotion_extracted = True
+                                # 从完整文本中移除标签
+                                full_text = re.sub(r'^\[[^\]]+\]', '', full_text)
+                                # 重置日语文本标志，因为表情切换了
+                                japanese_emitted = False
+                                last_chinese_length = 0
+                                # 如果当前块包含标签后的内容，只返回标签后的部分
+                                if ']' in content:
+                                    content = content.split(']', 1)[-1]
+                                else:
+                                    continue  # 跳过包含标签的块
+                        else:
+                            break
 
                     # 实时解析 [表情]日语|中文 格式
                     if emotion_extracted:
@@ -1134,9 +1273,22 @@ class AIChatManager:
             if not emotion_extracted:
                 emotion = "normal"
 
-            # 添加到历史（移除标签后的纯文本）
-            clean_text = re.sub(r'^\[\w+\]', '', full_text).strip()
-            self.conversation_history.append({"role": "assistant", "content": clean_text})
+            # 添加到历史（只保存中文部分）
+            # 从历史记录中提取中文文本
+            history_text = ""
+            if '|' in full_text:
+                # 移除表情标签，提取中文部分
+                text_without_emotion = re.sub(r'^\[\w+\]', '', full_text).strip()
+                parts = text_without_emotion.split('|', 1)
+                if len(parts) > 1:
+                    history_text = parts[1].strip()  # 中文部分
+                else:
+                    history_text = text_without_emotion
+            else:
+                # 如果没有分隔符，使用移除标签后的文本
+                history_text = re.sub(r'^\[\w+\]', '', full_text).strip()
+            
+            self.conversation_history.append({"role": "assistant", "content": history_text})
 
         except Exception as e:
             print(f"AI API流式调用错误: {e}")
@@ -1160,13 +1312,18 @@ class AIChatManager:
             # 调用API生成双语回复（流式传输 + 禁用思考模式）
             messages = [
                 {"role": "system", "content": self.BILINGUAL_GENERATION_PROMPT}
-            ] + self.conversation_history[-100:]
+            ] + (self.conversation_history if self.permanent_memory else self.conversation_history[-100:])  # 永久记忆时使用全部历史，否则保留最近100轮对话
+
+            # 从QSettings获取用户设置的max_tokens值
+            from PyQt6.QtCore import QSettings
+            qsettings = QSettings("AMDS", "Amadeus")
+            max_tokens = qsettings.value("max_tokens", 500, type=int)
 
             response = self.client.chat.completions.create(
-                model=self.MODEL,
+                model=self.current_model,
                 messages=messages,
                 temperature=0.8,
-                max_tokens=500,
+                max_tokens=max_tokens,
                 stream=True,
                 extra_body={"thinking": {"type": "disabled"}}
             )
@@ -1398,7 +1555,8 @@ class ChatWorker(QThread):
                 self.ai_manager.conversation_history.append({"role": "user", "content": user_content})
 
                 # 检查记忆极限
-                if len(self.ai_manager.conversation_history) >= 200:
+                # 永久记忆功能开启时不显示记忆极限提示
+                if not self.ai_manager.permanent_memory and len(self.ai_manager.conversation_history) >= 200:
                     message, emotion = self.ai_manager._get_memory_limit_message()
                     self.emotion_ready.emit(emotion)
                     for char in message:
@@ -1412,7 +1570,7 @@ class ChatWorker(QThread):
                 # 流式生成双语回复
                 messages = [
                     {"role": "system", "content": self.ai_manager.BILINGUAL_GENERATION_PROMPT}
-                ] + self.ai_manager.conversation_history[-100:]
+                ] + (self.ai_manager.conversation_history if self.ai_manager.permanent_memory else self.ai_manager.conversation_history[-100:])  # 永久记忆时使用全部历史，否则保留最近100轮对话
 
                 response = self.ai_manager.client.chat.completions.create(
                     model=self.ai_manager.MODEL,
@@ -1447,14 +1605,14 @@ class ChatWorker(QThread):
                     import re
                     print(f"[音频模式] 完整内容: {full_content}")
                     
-                    # 先检查是否包含表情标记
-                    if '[' in full_content and ']' in full_content:
-                        # 提取表情
-                        emotion_match = re.match(r'\[([^\]]+)\]', full_content)
-                        if emotion_match:
-                            emotion = emotion_match.group(1)
-                            full_content = full_content[emotion_match.end():].strip()
-                            print(f"[音频模式] 提取表情: {emotion}, 剩余内容: {full_content}")
+                    # 处理多个表情标签
+                    # 提取最后一个表情标签（因为它是最新的）
+                    emotion_matches = re.findall(r'\[([^\]]+)\]', full_content)
+                    if emotion_matches:
+                        emotion = emotion_matches[-1]  # 使用最后一个表情标签
+                        # 移除所有表情标签
+                        full_content = re.sub(r'\[[^\]]+\]', '', full_content).strip()
+                        print(f"[音频模式] 提取表情: {emotion}, 剩余内容: {full_content}")
 
                     if '|' in full_content:
                         parts = full_content.split('|', 1)
@@ -1613,6 +1771,12 @@ class ChatWidget(QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.ai_manager = None  # 延迟初始化
+        self.audio_generator = None  # 延迟初始化
+        self.vocu_voice_id = None
+        self.current_worker = None  # 当前工作线程
+        self.current_streaming_text = ""  # 当前流式显示的文本
+        self.permanent_memory = False  # 永久记忆功能
         self.setup_ui()
     
     def setup_ui(self):
@@ -1693,23 +1857,25 @@ class ChatWidget(QWidget):
         # 当前附加的图片
         self.attached_image_path = None
     
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.ai_manager = None  # 延迟初始化
-        self.audio_generator = None  # 延迟初始化
-        self.vocu_voice_id = None
-        self.current_worker = None  # 当前工作线程
-        self.current_streaming_text = ""  # 当前流式显示的文本
-        self.setup_ui()
-    
     def init_resources(self):
         """初始化资源（异步调用）"""
         print("[初始化] 开始初始化资源...")
         
-        # 初始化AI管理器
-        self.ai_manager = AIChatManager()
+        # 加载模型设置
+        from PyQt6.QtCore import QSettings
+        qsettings = QSettings("AMDS", "Amadeus")
+        model_type = qsettings.value("model_type", "默认")
+        custom_model_url = qsettings.value("custom_model_url", "http://localhost:11434")
+        custom_model_name = qsettings.value("custom_model_name", "")
+        
+        # 加载永久记忆设置
+        self.permanent_memory = qsettings.value("permanent_memory", False, type=bool)
+        print(f"[初始化] 永久记忆功能: {'启用' if self.permanent_memory else '禁用'}")
+        
+        # 初始化AI管理器（不加载历史，延迟加载）
+        self.ai_manager = AIChatManager(model_type, custom_model_url, custom_model_name, load_history=False)
         saved_key = AIChatManager.load_api_key()
-        if saved_key:
+        if saved_key and model_type != "自定义":
             self.ai_manager.API_KEY = saved_key
             from openai import OpenAI
             self.ai_manager.client = OpenAI(
@@ -1717,11 +1883,33 @@ class ChatWidget(QWidget):
                 api_key=saved_key
             )
             print(f"[初始化] 已加载保存的API密钥")
+        elif model_type == "自定义":
+            print(f"[初始化] 使用自定义模型: {custom_model_name} at {custom_model_url}")
         
-        # 初始化音频生成器
-        self._init_audio_generator()
+        # 延迟加载对话历史（主窗口显示后）
+        if self.permanent_memory:
+            from PyQt6.QtCore import QTimer
+            QTimer.singleShot(1000, self.load_conversation_history)
         
-        print("[初始化] 资源初始化完成")
+        # 延迟初始化音频生成器（主窗口显示后）
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(1500, self._init_audio_generator)
+        
+        print("[初始化] 基本资源初始化完成")
+    
+    def load_conversation_history(self):
+        """延迟加载对话历史"""
+        if self.ai_manager and self.permanent_memory:
+            print("[延迟加载] 开始加载对话历史...")
+            self.ai_manager.load_conversation()
+            if self.ai_manager.conversation_history:
+                print(f"[延迟加载] 显示 {len(self.ai_manager.conversation_history)} 条对话历史")
+                for message in self.ai_manager.conversation_history:
+                    if message["role"] == "user":
+                        self.add_message("你", message["content"], "#0066CC")
+                    elif message["role"] == "assistant":
+                        self.add_message("牧濑红莉栖", message["content"], "#8B4513")
+            print("[延迟加载] 对话历史加载完成")
 
     def _init_audio_generator(self):
         """初始化音频生成器"""
@@ -2003,6 +2191,22 @@ class ChatWidget(QWidget):
             self._on_japanese_text_ready(japanese_text)
             return
 
+        # 检查是否包含表情标签
+        if '[' in chunk and ']' in chunk:
+            import re
+            match = re.search(r'\[([^\]]+)\]', chunk)
+            if match:
+                # 提取表情标签
+                emotion = match.group(1)
+                print(f"[流式传输] 检测到表情标签: {emotion}")
+                # 更新表情
+                self._on_emotion_ready(emotion)
+                # 移除表情标签，只显示文本部分
+                chunk = re.sub(r'^\[[^\]]+\]', '', chunk).strip()
+                # 如果移除标签后没有文本，直接返回
+                if not chunk:
+                    return
+
         # 使用 QTextCursor 插入带颜色的文本片段
         cursor = self.chat_history.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
@@ -2123,6 +2327,10 @@ class ChatWidget(QWidget):
         self.input_field.setFocus()
 
         self.current_streaming_text = ""
+        
+        # 保存对话历史（如果启用了永久记忆）
+        if self.permanent_memory and self.ai_manager:
+            self.ai_manager.save_conversation()
 
     def _on_ai_error(self, error_msg: str):
         """AI调用出错时的回调"""
@@ -2374,7 +2582,6 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None, current_api_key="", vocu_api_key="", vocu_voice_id="", audio_mode=True, current_max_tokens=500):
         super().__init__(parent)
         self.setWindowTitle("设置")
-        self.setFixedSize(450, 400)
 
         # 设置样式
         self.setStyleSheet("""
@@ -2391,6 +2598,15 @@ class SettingsDialog(QDialog):
                 border: 2px solid #8B4513;
                 background-color: white;
                 color: #333;
+                min-width: 300px;
+            }
+            QComboBox {
+                padding: 8px;
+                border-radius: 5px;
+                border: 2px solid #8B4513;
+                background-color: white;
+                color: #333;
+                min-width: 300px;
             }
             QPushButton {
                 padding: 10px 20px;
@@ -2418,22 +2634,127 @@ class SettingsDialog(QDialog):
             }
         """)
 
-        layout = QFormLayout(self)
-
+        layout = QVBoxLayout(self)  # 使用垂直布局代替表单布局
+        layout.setSpacing(15)
+        layout.setContentsMargins(25, 25, 25, 25)
+        
+        # 创建网格布局用于模型设置
+        model_layout = QGridLayout()
+        model_layout.setColumnStretch(1, 1)
+        model_layout.setHorizontalSpacing(10)
+        model_layout.setVerticalSpacing(8)
+        
+        # 模型类型选择
+        model_type_label = QLabel("模型类型:")
+        model_type_label.setStyleSheet("color: #D2691E; font-size: 14px;")
+        model_type_label.setMinimumWidth(100)
+        self.model_type_combo = QComboBox()
+        model_types = ["默认", "自定义"]
+        self.model_type_combo.addItems(model_types)
+        model_layout.addWidget(model_type_label, 0, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        model_layout.addWidget(self.model_type_combo, 0, 1)
+        
+        # 模型选择（默认模式）
+        default_model_label = QLabel("默认模型:")
+        default_model_label.setStyleSheet("color: #D2691E; font-size: 14px;")
+        default_model_label.setMinimumWidth(100)
+        self.model_combo = QComboBox()
+        model_options = [
+            "doubao-seed-1-6-lite-251015",
+            "doubao-seed-1-8-251228",
+            "doubao-seed-2-0-lite-260215",
+            "doubao-seed-2-0-mini-260215",
+            "doubao-seed-2-0-pro-260215"
+        ]
+        self.model_combo.addItems(model_options)
+        model_layout.addWidget(default_model_label, 1, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        model_layout.addWidget(self.model_combo, 1, 1)
+        
+        # 自定义模型URL
+        custom_url_label = QLabel("自定义模型URL:")
+        custom_url_label.setStyleSheet("color: #D2691E; font-size: 14px;")
+        custom_url_label.setMinimumWidth(100)
+        self.custom_model_url = QLineEdit()
+        self.custom_model_url.setPlaceholderText("输入自定义模型URL（如 http://localhost:11434）")
+        model_layout.addWidget(custom_url_label, 2, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        model_layout.addWidget(self.custom_model_url, 2, 1)
+        
+        # 自定义模型名称
+        custom_name_label = QLabel("自定义模型名称:")
+        custom_name_label.setStyleSheet("color: #D2691E; font-size: 14px;")
+        custom_name_label.setMinimumWidth(100)
+        self.custom_model_name = QLineEdit()
+        self.custom_model_name.setPlaceholderText("输入自定义模型名称（如 qwen3:8b, llama3, mistral 等）")
+        model_layout.addWidget(custom_name_label, 3, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        model_layout.addWidget(self.custom_model_name, 3, 1)
+        
+        from PyQt6.QtCore import QSettings
+        qsettings = QSettings("AMDS", "Amadeus")
+        current_model_type = qsettings.value("model_type", "默认")
+        current_model = qsettings.value("model", "doubao-seed-1-6-lite-251015")
+        current_custom_url = qsettings.value("custom_model_url", "http://localhost:11434")
+        current_custom_name = qsettings.value("custom_model_name", "")
+        
+        if current_model_type in model_types:
+            self.model_type_combo.setCurrentText(current_model_type)
+        if current_model in model_options:
+            self.model_combo.setCurrentText(current_model)
+        self.custom_model_url.setText(current_custom_url)
+        self.custom_model_name.setText(current_custom_name)
+        
+        # 创建API和Tokens布局
+        api_tokens_layout = QGridLayout()
+        api_tokens_layout.setColumnStretch(1, 1)
+        api_tokens_layout.setHorizontalSpacing(10)
+        api_tokens_layout.setVerticalSpacing(8)
+        
         # API密钥输入
+        api_key_label = QLabel("AI API密钥:")
+        api_key_label.setStyleSheet("color: #D2691E; font-size: 14px;")
+        api_key_label.setMinimumWidth(100)
         self.api_key_input = QLineEdit()
         self.api_key_input.setPlaceholderText("输入火山方舟API密钥...")
         self.api_key_input.setText(current_api_key)
         self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        layout.addRow("AI API密钥:", self.api_key_input)
-
+        api_tokens_layout.addWidget(api_key_label, 0, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        api_tokens_layout.addWidget(self.api_key_input, 0, 1)
+        
+        # 动态显示/隐藏模型选项
+        def update_model_visibility():
+            is_custom = self.model_type_combo.currentText() == "自定义"
+            default_model_label.setVisible(not is_custom)
+            self.model_combo.setVisible(not is_custom)
+            custom_url_label.setVisible(is_custom)
+            self.custom_model_url.setVisible(is_custom)
+            custom_name_label.setVisible(is_custom)
+            self.custom_model_name.setVisible(is_custom)
+            # 当模型类型为自定义时，隐藏AI API密钥选项
+            api_key_label.setVisible(not is_custom)
+            self.api_key_input.setVisible(not is_custom)
+        
+        self.model_type_combo.currentTextChanged.connect(update_model_visibility)
+        update_model_visibility()
+        
+        # 添加模型布局到主布局
+        layout.addLayout(model_layout)
+        
+        # 分隔线
+        line = QLabel("─" * 40)
+        line.setStyleSheet("color: #8B4513;")
+        line.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(line)
+        
         # Tokens长度滑块
+        tokens_label = QLabel("最大Tokens长度:")
+        tokens_label.setStyleSheet("color: #D2691E; font-size: 14px;")
+        tokens_label.setMinimumWidth(100)
         self.max_tokens_slider = QSlider(Qt.Orientation.Horizontal)
         self.max_tokens_slider.setMinimum(50)
         self.max_tokens_slider.setMaximum(2000)
         self.max_tokens_slider.setValue(current_max_tokens)
         self.max_tokens_slider.setTickInterval(100)
         self.max_tokens_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.max_tokens_slider.setMinimumWidth(250)
         
         # 显示当前tokens值的标签
         self.max_tokens_label = QLabel(f"{current_max_tokens}")
@@ -2444,53 +2765,31 @@ class SettingsDialog(QDialog):
         self.max_tokens_slider.valueChanged.connect(lambda value: self.max_tokens_label.setText(f"{value}"))
         
         # 创建水平布局来放置滑块和标签
-        tokens_layout = QHBoxLayout()
-        tokens_layout.addWidget(self.max_tokens_slider)
-        tokens_layout.addWidget(self.max_tokens_label)
+        tokens_control_layout = QHBoxLayout()
+        tokens_control_layout.addWidget(self.max_tokens_slider)
+        tokens_control_layout.addWidget(self.max_tokens_label)
         
-        layout.addRow("最大Tokens长度:", tokens_layout)
+        tokens_control_widget = QWidget()
+        tokens_control_widget.setLayout(tokens_control_layout)
+        
+        api_tokens_layout.addWidget(tokens_label, 1, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        api_tokens_layout.addWidget(tokens_control_widget, 1, 1)
+        
+        # 添加API和Tokens布局到主布局
+        layout.addLayout(api_tokens_layout)
         
         # 提示文字
         tokens_tip = QLabel('长度越长，生成时间越长，音频处理消耗点数越多。\n注意：50个tokens实际可能只有25-40个中文字符输出')
         tokens_tip.setStyleSheet('color: #888; font-size: 12px;')
         tokens_tip.setWordWrap(True)
-        layout.addRow('', tokens_tip)
-
-        # 模型选择
-        self.model_combo = QComboBox()
-        model_options = [
-            "doubao-seed-1-6-lite-251015",
-            "doubao-seed-1-8-251228",
-            "doubao-seed-2-0-lite-260215",
-            "doubao-seed-2-0-mini-260215",
-            "doubao-seed-2-0-pro-260215"
-        ]
-        self.model_combo.addItems(model_options)
-        from PyQt6.QtCore import QSettings
-        qsettings = QSettings("AMDS", "Amadeus")
-        current_model = qsettings.value("model", "doubao-seed-1-6-lite-251015")
-        if current_model in model_options:
-            self.model_combo.setCurrentText(current_model)
-        layout.addRow("模型选择:", self.model_combo)
-
+        layout.addWidget(tokens_tip)
+        
         # 分隔线
-        line = QLabel("─" * 40)
-        line.setStyleSheet("color: #8B4513;")
-        layout.addRow("", line)
-
-        # Vocu API密钥输入（日语音频生成）
-        self.vocu_api_key_input = QLineEdit()
-        self.vocu_api_key_input.setPlaceholderText("输入Vocu API密钥（可选，用于日语音频生成）...")
-        self.vocu_api_key_input.setText(vocu_api_key)
-        self.vocu_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        layout.addRow("Vocu API密钥:", self.vocu_api_key_input)
-
-        # Vocu声音ID输入
-        self.vocu_voice_id_input = QLineEdit()
-        self.vocu_voice_id_input.setPlaceholderText("输入Vocu声音ID（用于日语音频生成）...")
-        self.vocu_voice_id_input.setText(vocu_voice_id)
-        layout.addRow("Vocu声音ID:", self.vocu_voice_id_input)
-
+        line2 = QLabel("─" * 40)
+        line2.setStyleSheet("color: #8B4513;")
+        line2.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(line2)
+        
         # 音频模式开关
         self.audio_mode_checkbox = QCheckBox("启用音频模式（生成日语音频）")
         self.audio_mode_checkbox.setChecked(audio_mode)
@@ -2515,28 +2814,119 @@ class SettingsDialog(QDialog):
                 background: #FF6347;
             }
         """)
-        layout.addRow("", self.audio_mode_checkbox)
-
+        layout.addWidget(self.audio_mode_checkbox)
+        
+        # 永久记忆功能开关（实验性）
+        self.permanent_memory_checkbox = QCheckBox("启用永久记忆（实验性）")
+        # 从QSettings加载永久记忆设置
+        from PyQt6.QtCore import QSettings
+        qsettings = QSettings("AMDS", "Amadeus")
+        permanent_memory = qsettings.value("permanent_memory", False, type=bool)
+        self.permanent_memory_checkbox.setChecked(permanent_memory)
+        self.permanent_memory_checkbox.setStyleSheet("""
+            QCheckBox {
+                color: #FFFFFF;
+                font-size: 13px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+                border: 2px solid #FFFFFF;
+                border-radius: 4px;
+                background: #2C1810;
+            }
+            QCheckBox::indicator:checked {
+                background: #4CAF50;
+                border-color: #FFFFFF;
+            }
+            QCheckBox::indicator:checked:hover {
+                background: #4CAF50;
+            }
+        """)
+        layout.addWidget(self.permanent_memory_checkbox)
+        
+        # 永久记忆功能说明
+        memory_info = QLabel("开启后将永久保存对话历史，关闭软件后再打开仍能保持记忆。关闭此选项会清除所有历史记录并重启软件。（实际仍受限于上下文窗口，但256k的极限应该一时半会不会用完）")
+        memory_info.setStyleSheet("color: #888; font-size: 11px;")
+        memory_info.setWordWrap(True)
+        layout.addWidget(memory_info)
+        
+        # 创建Vocu布局
+        vocu_layout = QGridLayout()
+        vocu_layout.setColumnStretch(1, 1)
+        vocu_layout.setHorizontalSpacing(10)
+        vocu_layout.setVerticalSpacing(8)
+        
+        # Vocu API密钥输入（日语音频生成）
+        vocu_api_label = QLabel("Vocu API密钥:")
+        vocu_api_label.setStyleSheet("color: #D2691E; font-size: 14px;")
+        vocu_api_label.setMinimumWidth(100)
+        self.vocu_api_key_input = QLineEdit()
+        self.vocu_api_key_input.setPlaceholderText("输入Vocu API密钥（可选，用于日语音频生成）...")
+        self.vocu_api_key_input.setText(vocu_api_key)
+        self.vocu_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        vocu_layout.addWidget(vocu_api_label, 0, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        vocu_layout.addWidget(self.vocu_api_key_input, 0, 1)
+        
+        # Vocu声音ID输入
+        vocu_voice_label = QLabel("Vocu声音ID:")
+        vocu_voice_label.setStyleSheet("color: #D2691E; font-size: 14px;")
+        vocu_voice_label.setMinimumWidth(100)
+        self.vocu_voice_id_input = QLineEdit()
+        self.vocu_voice_id_input.setPlaceholderText("输入Vocu声音ID（用于日语音频生成）...")
+        self.vocu_voice_id_input.setText(vocu_voice_id)
+        vocu_layout.addWidget(vocu_voice_label, 1, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        vocu_layout.addWidget(self.vocu_voice_id_input, 1, 1)
+        
         # 点数显示
         self.credits_label = QLabel("点数: 查询中...")
         self.credits_label.setStyleSheet("color: #FFD700; font-size: 13px;")
-        layout.addRow("", self.credits_label)
-
+        
         # 查询点数按钮
         self.refresh_credits_btn = QPushButton("刷新点数")
         self.refresh_credits_btn.clicked.connect(self._fetch_credits)
-        layout.addRow("", self.refresh_credits_btn)
-
+        
         # 说明文字
-        vocu_info = QLabel("配置后可生成牧濑红莉栖的日语音频")
-        vocu_info.setStyleSheet("color: #888; font-size: 11px;")
-        layout.addRow("", vocu_info)
+        self.vocu_info = QLabel("配置后可生成牧濑红莉栖的日语音频")
+        self.vocu_info.setStyleSheet("color: #888; font-size: 11px;")
+        
+        # 动态显示/隐藏Vocu设置
+        def update_audio_visibility():
+            is_audio_enabled = self.audio_mode_checkbox.isChecked()
+            vocu_api_label.setVisible(is_audio_enabled)
+            self.vocu_api_key_input.setVisible(is_audio_enabled)
+            vocu_voice_label.setVisible(is_audio_enabled)
+            self.vocu_voice_id_input.setVisible(is_audio_enabled)
+            self.credits_label.setVisible(is_audio_enabled)
+            self.refresh_credits_btn.setVisible(is_audio_enabled)
+            self.vocu_info.setVisible(is_audio_enabled)
+        
+        self.audio_mode_checkbox.stateChanged.connect(update_audio_visibility)
+        update_audio_visibility()
+        
+        # 添加Vocu布局到主布局
+        layout.addLayout(vocu_layout)
+        layout.addWidget(self.credits_label)
+        layout.addWidget(self.refresh_credits_btn)
+        layout.addWidget(self.vocu_info)
 
         # 项目GitHub地址
         github_link = QLabel('项目地址：<a href="https://github.com/Kur1oR3iko/AMDS-RE">https://github.com/Kur1oR3iko/AMDS-RE</a>')
         github_link.setStyleSheet("color: #4A90E2; font-size: 11px;")
         github_link.setOpenExternalLinks(True)
-        layout.addRow("", github_link)
+        layout.addWidget(github_link)
+        
+        # 作者信息
+        author_info = QLabel('b站/抖音"栗尾玲子Reiko"最新力作')
+        author_info.setStyleSheet("color: #888; font-size: 12px; margin-top: 8px;")
+        author_info.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(author_info)
+        
+        # 水友群信息
+        group_info = QLabel('水友群1:391437320，2群852680622')
+        group_info.setStyleSheet("color: #888; font-size: 12px; margin-top: 2px;")
+        group_info.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(group_info)
 
         # 按钮区域
         button_layout = QHBoxLayout()
@@ -2549,7 +2939,43 @@ class SettingsDialog(QDialog):
         self.cancel_button.clicked.connect(self.reject)
         button_layout.addWidget(self.cancel_button)
 
-        layout.addRow("", button_layout)
+        layout.addLayout(button_layout)
+        
+        # 调整大小以适应内容
+        self.adjustSize()
+        
+        # 连接信号，当内容变化时重新调整大小
+        def adjust_dialog_size():
+            # 先隐藏所有动态元素
+            default_model_label.setVisible(False)
+            self.model_combo.setVisible(False)
+            custom_url_label.setVisible(False)
+            self.custom_model_url.setVisible(False)
+            custom_name_label.setVisible(False)
+            self.custom_model_name.setVisible(False)
+            api_key_label.setVisible(False)
+            self.api_key_input.setVisible(False)
+            
+            # 显示当前应该显示的元素
+            is_custom = self.model_type_combo.currentText() == "自定义"
+            is_audio = self.audio_mode_checkbox.isChecked()
+            
+            if not is_custom:
+                default_model_label.setVisible(True)
+                self.model_combo.setVisible(True)
+                api_key_label.setVisible(True)
+                self.api_key_input.setVisible(True)
+            else:
+                custom_url_label.setVisible(True)
+                self.custom_model_url.setVisible(True)
+                custom_name_label.setVisible(True)
+                self.custom_model_name.setVisible(True)
+            
+            # 调整大小
+            self.adjustSize()
+        
+        self.model_type_combo.currentTextChanged.connect(adjust_dialog_size)
+        self.audio_mode_checkbox.stateChanged.connect(adjust_dialog_size)
 
         # 延迟查询点数，避免阻塞对话框显示
         from PyQt6.QtCore import QTimer
@@ -2589,10 +3015,14 @@ class SettingsDialog(QDialog):
         """获取设置值"""
         return {
             "api_key": self.api_key_input.text().strip(),
+            "model_type": self.model_type_combo.currentText(),
             "model": self.model_combo.currentText(),
+            "custom_model_url": self.custom_model_url.text().strip(),
+            "custom_model_name": self.custom_model_name.text().strip(),
             "vocu_api_key": self.vocu_api_key_input.text().strip(),
             "vocu_voice_id": self.vocu_voice_id_input.text().strip(),
             "audio_mode": self.audio_mode_checkbox.isChecked(),
+            "permanent_memory": self.permanent_memory_checkbox.isChecked(),
             "max_tokens": self.max_tokens_slider.value()
         }
 
@@ -2702,33 +3132,60 @@ class MainWindow(QMainWindow):
     
     def play_tone(self):
         """播放启动音效 tone.ogg"""
+        print("[启动] 开始播放启动音效...")
         tone_path = AUDIO_DIR / "tone.ogg"
+        print(f"[启动] 启动音效路径: {tone_path}")
+        print(f"[启动] 启动音效文件存在: {tone_path.exists()}")
         if tone_path.exists():
+            print("[启动] 创建AudioPlayer实例...")
             self.tone_player = AudioPlayer(tone_path)
             # 连接完成信号，播放完启动音后再播放问候语
+            print("[启动] 连接完成信号...")
             self.tone_player.finished.connect(self.play_greeting)
+            print("[启动] 开始播放启动音效...")
             self.tone_player.start()
+        else:
+            print("[启动] 启动音效文件不存在")
 
     def play_greeting(self):
         """播放问候语 - 带动画和聊天显示"""
+        print("[启动] 开始播放问候语...")
+        # 如果启用了永久记忆，不播放欢迎语
+        if self.chat.permanent_memory:
+            print("[启动] 永久记忆功能已启用，跳过欢迎语")
+            return
+        
+        print("[启动] 获取随机问候语...")
         greeting = VoiceDialog.get_random_greeting()
+        print(f"[启动] 随机问候语: {greeting}")
 
         # 在聊天框显示问候语
+        print("[启动] 获取问候语文本...")
         greeting_text = self.chat.get_response_text(greeting)
+        print(f"[启动] 问候语文本: {greeting_text}")
         self.chat.add_message("牧濑红莉栖", greeting_text, "#8B4513")
 
         # 播放语音
         audio_path = AUDIO_DIR / f"{greeting}.ogg"
+        print(f"[启动] 问候语音频路径: {audio_path}")
+        print(f"[启动] 问候语音频文件存在: {audio_path.exists()}")
         if audio_path.exists():
             # 自动设置表情
+            print("[启动] 获取表情...")
             emotion = VoiceDialog.get_emotion_for_audio(greeting)
+            print(f"[启动] 表情: {emotion}")
             self.character.set_emotion(emotion)
 
+            print("[启动] 创建AudioPlayer实例...")
             self.player = AudioPlayer(audio_path)
             # 连接动画信号
+            print("[启动] 连接动画信号...")
             self.player.started.connect(self.character.start_speaking)
             self.player.finished.connect(self.character.stop_speaking)
+            print("[启动] 开始播放问候语音频...")
             self.player.start()
+        else:
+            print("[启动] 问候语音频文件不存在")
 
     def open_settings(self):
         """打开设置对话框"""
@@ -2761,19 +3218,107 @@ class MainWindow(QMainWindow):
                 # 保存到本地文件
                 self._save_api_key(settings["api_key"])
 
-            # 更新模型
+            # 更新模型和模型类型
             self.chat.ai_manager.MODEL = settings["model"]
             print(f"模型已更新为: {settings['model']}")
 
             # 重新初始化OpenAI客户端
-            self.chat.ai_manager.client = OpenAI(
-                base_url=self.chat.ai_manager.BASE_URL,
-                api_key=self.chat.ai_manager.API_KEY
-            )
+            if settings["model_type"] == "自定义":
+                # 保存当前对话历史
+                current_history = self.chat.ai_manager.conversation_history if hasattr(self.chat.ai_manager, 'conversation_history') else []
+                # 使用自定义模型
+                self.chat.ai_manager = AIChatManager(
+                    model_type=settings["model_type"],
+                    custom_model_url=settings["custom_model_url"],
+                    custom_model_name=settings["custom_model_name"]
+                )
+                # 恢复对话历史
+                self.chat.ai_manager.conversation_history = current_history
+                print(f"[设置] 已切换到自定义模型: {settings['custom_model_name']} at {settings['custom_model_url']}")
+            else:
+                # 使用默认模型
+                self.chat.ai_manager.client = OpenAI(
+                    base_url=self.chat.ai_manager.BASE_URL,
+                    api_key=self.chat.ai_manager.API_KEY
+                )
+                print(f"[设置] 已切换到默认模型: {settings['model']}")
 
+            # 处理永久记忆设置
+            old_permanent_memory = self.chat.permanent_memory
+            new_permanent_memory = settings.get("permanent_memory", False)
+            
             # 保存Vocu设置（始终保存，包括清空的情况）
             print(f"保存Vocu设置...")
-            self._save_vocu_settings(settings["vocu_api_key"], settings["vocu_voice_id"], settings["audio_mode"], settings["max_tokens"], settings["model"])
+            self._save_vocu_settings(
+                settings["vocu_api_key"], 
+                settings["vocu_voice_id"], 
+                settings["audio_mode"], 
+                settings["max_tokens"], 
+                settings["model"], 
+                settings["model_type"], 
+                settings["custom_model_url"], 
+                settings["custom_model_name"],
+                new_permanent_memory
+            )
+            
+            # 更新聊天组件和AI管理器的永久记忆设置
+            self.chat.permanent_memory = new_permanent_memory
+            if self.chat.ai_manager:
+                self.chat.ai_manager.permanent_memory = new_permanent_memory
+            
+            # 处理永久记忆状态变化
+            if old_permanent_memory and not new_permanent_memory:
+                # 从开启变为关闭：显示确认对话框
+                from PyQt6.QtWidgets import QMessageBox
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("确认关闭永久记忆")
+                msg_box.setText("你之前所说的背负所有人的记忆，就是这么一回事吗？")
+                
+                # 添加自定义按钮
+                confirm_button = msg_box.addButton("。。。", QMessageBox.ButtonRole.AcceptRole)
+                cancel_button = msg_box.addButton("我不关闭了", QMessageBox.ButtonRole.RejectRole)
+                
+                msg_box.exec()
+                
+                # 检查用户选择
+                if msg_box.clickedButton() == confirm_button:
+                    # 确认关闭：清除对话历史并重启
+                    print("永久记忆功能已关闭，正在清除对话历史...")
+                    if self.chat.ai_manager:
+                        self.chat.ai_manager.clear_conversation()
+                    # 重启软件
+                    import sys
+                    import os
+                    print("正在重启软件...")
+                    QApplication.instance().quit()
+                    # 重启当前进程
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                else:
+                    # 取消关闭：保持永久记忆开启
+                    print("用户取消关闭永久记忆")
+                    # 恢复永久记忆设置
+                    new_permanent_memory = True
+                    self.chat.permanent_memory = new_permanent_memory
+                    if self.chat.ai_manager:
+                        self.chat.ai_manager.permanent_memory = new_permanent_memory
+                    # 重新保存设置
+                    self._save_vocu_settings(
+                        settings["vocu_api_key"], 
+                        settings["vocu_voice_id"], 
+                        settings["audio_mode"], 
+                        settings["max_tokens"], 
+                        settings["model"], 
+                        settings["model_type"], 
+                        settings["custom_model_url"], 
+                        settings["custom_model_name"],
+                        new_permanent_memory
+                    )
+            elif not old_permanent_memory and new_permanent_memory:
+                # 从关闭变为开启：加载对话历史
+                print("永久记忆功能已开启，正在加载对话历史...")
+                if self.chat.ai_manager:
+                    self.chat.ai_manager.load_conversation()
+            
             # 重新初始化音频生成器
             self.chat._init_audio_generator()
 
@@ -2802,7 +3347,7 @@ class MainWindow(QMainWindow):
             print(f"加载配置失败: {e}")
         return ""
 
-    def _save_vocu_settings(self, api_key: str, voice_id: str, audio_mode: bool = True, max_tokens: int = 500, model: str = "doubao-seed-1-6-lite-251015"):
+    def _save_vocu_settings(self, api_key: str, voice_id: str, audio_mode: bool = True, max_tokens: int = 500, model: str = "doubao-seed-1-6-lite-251015", model_type: str = "默认", custom_model_url: str = "http://localhost:11434", custom_model_name: str = "", permanent_memory: bool = False):
         """保存Vocu设置到QSettings"""
         from PyQt6.QtCore import QSettings
         
@@ -2814,10 +3359,14 @@ class MainWindow(QMainWindow):
             qsettings.setValue("audio_mode", audio_mode)
             qsettings.setValue("max_tokens", max_tokens)
             qsettings.setValue("model", model)
+            qsettings.setValue("model_type", model_type)
+            qsettings.setValue("custom_model_url", custom_model_url)
+            qsettings.setValue("custom_model_name", custom_model_name)
+            qsettings.setValue("permanent_memory", permanent_memory)
             
             qsettings.sync()
             
-            print(f"Vocu配置已保存: api_key={'*' * len(api_key) if api_key else '空'}, voice_id={voice_id or '空'}, audio_mode={audio_mode}, max_tokens={max_tokens}, model={model}")
+            print(f"Vocu配置已保存: api_key={'*' * len(api_key) if api_key else '空'}, voice_id={voice_id or '空'}, audio_mode={audio_mode}, max_tokens={max_tokens}, model={model}, model_type={model_type}, custom_model_url={custom_model_url}, custom_model_name={custom_model_name}")
         except Exception as e:
             print(f"保存Vocu配置失败: {e}")
             import traceback
@@ -2867,7 +3416,7 @@ class SplashScreen(QMainWindow):
         layout.addWidget(self.loading_text)
         
         # 版本信息
-        version = QLabel("v0.0.2")
+        version = QLabel("v0.1.0")
         version.setAlignment(Qt.AlignmentFlag.AlignCenter)
         version.setStyleSheet("""
             QLabel {
@@ -2942,6 +3491,7 @@ def main():
         window.show()
         window.play_tone()  # 播放启动音效（问候语会在启动音播放完后自动播放）
     
+    from PyQt6.QtCore import QTimer
     QTimer.singleShot(2500, show_main_window)
     
     sys.exit(app.exec())

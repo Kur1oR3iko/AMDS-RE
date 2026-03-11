@@ -53,7 +53,11 @@ echo [OK] Icon converted
 echo.
 echo [4/4] Building...
 
-python -m PyInstaller --onefile --windowed --name "AMDS" --icon="assets/images/icon.ico" --add-data "assets;assets" "src/main.py"
+REM Clean previous build
+if exist "build" rmdir /s /q "build"
+if exist "dist" rmdir /s /q "dist"
+
+python -m PyInstaller --onefile --windowed --name "AMDS" --icon="assets/images/logo39.ico" --add-data "assets;assets" --disable-windowed-traceback "src/main.py"
 
 if errorlevel 1 (
     echo.
