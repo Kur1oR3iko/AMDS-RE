@@ -1,4 +1,4 @@
-# AMDS-RE (Amadeus) 项目说明
+# AMDS-RE (Amadeus) 项目说明（20260215写，后续更新我懒得在这里补了，直接写在release）
 未来装置研究所最新力作，爱来自Kurio
 b站： https://b23.tv/24zTirI
 <img width="1214" height="854" alt="e7679063-aa0c-4ab3-a959-b3983a75b161" src="https://github.com/user-attachments/assets/a143c6f8-13c6-4c87-b79b-6e1e9d3ecb78" />
