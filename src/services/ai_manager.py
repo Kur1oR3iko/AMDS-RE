@@ -78,7 +78,7 @@ class AIChatManager:
         else:
             # 火山方舟（豆包）云端 API
             base_url = self.BASE_URL
-            api_key = self.API_KEY
+            api_key = self.API_KEY or "missing-api-key"
             model = LEGACY_MODEL_MAP.get(self.MODEL, self.MODEL)
             self.MODEL = model
         

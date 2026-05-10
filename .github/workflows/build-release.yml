@@ -1,0 +1,105 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows release
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Build AMDS
+        run: python build.py
+
+      - name: Set release names
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '[\\/:*?"<>|]', '-'
+          "RELEASE_NAME=AMDS-$version" >> $env:GITHUB_ENV
+          "RELEASE_ZIP=AMDS-$version.zip" >> $env:GITHUB_ENV
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath "dist\AMDS\AMDS.exe" -PathType Leaf)) {
+            throw "Missing dist\AMDS\AMDS.exe"
+          }
+
+          if (-not (Test-Path -LiteralPath "dist\AMDS\_internal" -PathType Container)) {
+            throw "Missing dist\AMDS\_internal"
+          }
+
+      - name: Create release zip
+        shell: pwsh
+        run: |
+          $releaseDir = Join-Path "dist" $env:RELEASE_NAME
+          if (Test-Path -LiteralPath $releaseDir) {
+            Remove-Item -LiteralPath $releaseDir -Recurse -Force
+          }
+
+          Copy-Item -LiteralPath "dist\AMDS" -Destination $releaseDir -Recurse
+          Compress-Archive -Path $releaseDir -DestinationPath "dist\$env:RELEASE_ZIP" -Force
+
+      - name: Verify release zip layout
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $archive = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path "dist\$env:RELEASE_ZIP"))
+          try {
+            $entries = $archive.Entries | ForEach-Object { $_.FullName -replace "\\", "/" }
+            $expectedExe = "$env:RELEASE_NAME/AMDS.exe"
+            $expectedInternal = "$env:RELEASE_NAME/_internal/*"
+
+            if ($entries -notcontains $expectedExe) {
+              throw "$env:RELEASE_ZIP must contain $expectedExe"
+            }
+
+            $internalEntries = $entries | Where-Object { $_ -like $expectedInternal }
+            if (-not $internalEntries) {
+              throw "$env:RELEASE_ZIP must contain $env:RELEASE_NAME/_internal/"
+            }
+
+            if ($entries -contains "AMDS.exe") {
+              throw "$env:RELEASE_ZIP must not place AMDS.exe at the zip root"
+            }
+          }
+          finally {
+            $archive.Dispose()
+          }
+
+      - name: Upload zip to GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          $asset = "dist\$env:RELEASE_ZIP#$env:RELEASE_ZIP"
+
+          gh release view $env:TAG_NAME *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG_NAME $asset --clobber
+          }
+          else {
+            gh release create $env:TAG_NAME $asset --title $env:TAG_NAME --notes "Automated release for $env:TAG_NAME"
+          }

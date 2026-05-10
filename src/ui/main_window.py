@@ -295,7 +295,7 @@ class MainWindow(QMainWindow):
         else:
             self.chat.ai_manager.client = OpenAI(
                 base_url=self.chat.ai_manager.BASE_URL,
-                api_key=self.chat.ai_manager.API_KEY,
+                api_key=self.chat.ai_manager.API_KEY or "missing-api-key",
             )
             print(f"[设置] 已切换到默认模型: {settings['model']}")
 
