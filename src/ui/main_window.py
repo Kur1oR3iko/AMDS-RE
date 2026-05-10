@@ -6,7 +6,6 @@ import json
 import os
 import sys
 
-from openai import OpenAI
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QIcon, QPixmap
 from PyQt6.QtWidgets import (
@@ -22,6 +21,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.app_config import (
+    DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_MODEL,
     DEFAULT_PRESET_AUDIO_PROBABILITY,
     DEFAULT_VOCU_ASYNC_MODE,
@@ -268,30 +268,36 @@ class MainWindow(QMainWindow):
             f"max_tokens={settings['max_tokens']}"
         )
 
+        effective_api_key = settings["api_key"] or self.chat.ai_manager.API_KEY or AIChatManager.load_api_key()
         if settings["api_key"]:
-            self.chat.ai_manager.API_KEY = settings["api_key"]
             self._save_api_key(settings["api_key"])
 
-        self.chat.ai_manager.MODEL = LEGACY_MODEL_MAP.get(settings["model"], settings["model"])
-        self.chat.ai_manager.current_model = self.chat.ai_manager.MODEL
+        AIChatManager.API_KEY = effective_api_key
+        AIChatManager.MODEL = LEGACY_MODEL_MAP.get(settings["model"], settings["model"])
         print(f"模型已更新为: {settings['model']}")
 
-        if settings["model_type"] == "自定义":
-            current_history = (
-                self.chat.ai_manager.conversation_history
-                if hasattr(self.chat.ai_manager, "conversation_history")
-                else []
-            )
-            self.chat.ai_manager = AIChatManager(
-                model_type=settings["model_type"],
-                custom_model_url=settings["custom_model_url"],
-                custom_model_name=settings["custom_model_name"],
-            )
-            self.chat.ai_manager.conversation_history = current_history
+        current_history = (
+            self.chat.ai_manager.conversation_history
+            if hasattr(self.chat.ai_manager, "conversation_history")
+            else []
+        )
+        self.chat.ai_manager = AIChatManager(
+            model_type=settings["model_type"],
+            custom_model_url=settings["custom_model_url"],
+            custom_model_name=settings["custom_model_name"],
+            deepseek_api_key=settings["deepseek_api_key"],
+            deepseek_model=settings["deepseek_model"],
+        )
+        self.chat.ai_manager.API_KEY = effective_api_key
+        self.chat.ai_manager.conversation_history = current_history
+
+        if settings["model_type"] == "Ollama":
             print(
-                f"[设置] 已切换到自定义模型: {settings['custom_model_name']} "
+                f"[设置] 已切换到 Ollama 模型: {settings['custom_model_name']} "
                 f"at {settings['custom_model_url']}"
             )
+        elif settings["model_type"] == "Deepseek":
+            print(f"[设置] 已切换到 Deepseek 模型: {settings['deepseek_model']}")
         else:
             self.chat.ai_manager.client = OpenAI(
                 base_url=self.chat.ai_manager.BASE_URL,
@@ -311,6 +317,8 @@ class MainWindow(QMainWindow):
             settings["model_type"],
             settings["custom_model_url"],
             settings["custom_model_name"],
+            settings["deepseek_api_key"],
+            settings["deepseek_model"],
             new_permanent_memory,
             settings["preset_audio_probability"],
             settings["vocu_async_mode"],
@@ -361,6 +369,8 @@ class MainWindow(QMainWindow):
             settings["model_type"],
             settings["custom_model_url"],
             settings["custom_model_name"],
+            settings["deepseek_api_key"],
+            settings["deepseek_model"],
             True,
             settings["preset_audio_probability"],
             settings["vocu_async_mode"],
@@ -397,6 +407,8 @@ class MainWindow(QMainWindow):
         model_type: str = "默认",
         custom_model_url: str = "http://localhost:11434",
         custom_model_name: str = "",
+        deepseek_api_key: str = "",
+        deepseek_model: str = DEFAULT_DEEPSEEK_MODEL,
         permanent_memory: bool = False,
         preset_audio_probability: int = DEFAULT_PRESET_AUDIO_PROBABILITY,
         vocu_async_mode: bool = DEFAULT_VOCU_ASYNC_MODE,
@@ -413,6 +425,8 @@ class MainWindow(QMainWindow):
             qsettings.setValue("model_type", model_type)
             qsettings.setValue("custom_model_url", custom_model_url)
             qsettings.setValue("custom_model_name", custom_model_name)
+            qsettings.setValue("deepseek_api_key", deepseek_api_key)
+            qsettings.setValue("deepseek_model", deepseek_model)
             qsettings.setValue("permanent_memory", permanent_memory)
             qsettings.setValue("preset_audio_probability", preset_audio_probability)
             qsettings.setValue("vocu_async_mode", vocu_async_mode)

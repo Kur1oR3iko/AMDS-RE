@@ -1,6 +1,6 @@
 """
 AI 对话管理器
-封装火山方舟（豆包）/ 自定义模型的 API 调用，负责对话上下文管理、
+封装火山方舟（豆包）/ Ollama / Deepseek 的 API 调用，负责对话上下文管理、
 流式生成、中日双语解析、预设语音选择等功能
 """
 
@@ -10,7 +10,13 @@ import re
 
 from openai import OpenAI
 
-from core.app_config import DEFAULT_MODEL, LEGACY_MODEL_MAP
+from core.app_config import (
+    DEEPSEEK_BASE_URL,
+    DEEPSEEK_MODEL_OPTIONS,
+    DEFAULT_DEEPSEEK_MODEL,
+    DEFAULT_MODEL,
+    LEGACY_MODEL_MAP,
+)
 from core.character_skill import build_prompt_bundle
 from core.reply_parser import (
     format_image_history_text,
@@ -27,7 +33,7 @@ from utils.thread_pool import submit_io
 class AIChatManager:
     """
     AI 对话管理器
-    通过 OpenAI 兼容协议对接火山方舟或自定义模型，
+    通过 OpenAI 兼容协议对接火山方舟、Ollama 或 Deepseek，
     管理对话历史、表情分析、双语生成等核心对话逻辑
     """
 
@@ -58,23 +64,40 @@ class AIChatManager:
     PRESET_SELECTOR_PROMPT = _PROMPT_BUNDLE.preset_selector_prompt
     EMOTION_SELECTOR_PROMPT = _PROMPT_BUNDLE.emotion_selector_prompt
     
-    def __init__(self, model_type="默认", custom_model_url="http://localhost:11434", custom_model_name="", load_history=False):
+    def __init__(
+        self,
+        model_type="默认",
+        custom_model_url="http://localhost:11434",
+        custom_model_name="",
+        deepseek_api_key="",
+        deepseek_model=DEFAULT_DEEPSEEK_MODEL,
+        load_history=False,
+    ):
         """
         初始化 AI 对话管理器
         Args:
-            model_type: "默认" 使用火山方舟 API，"自定义" 使用 Ollama 等本地模型
-            custom_model_url: 自定义模型的 API 地址（仅 model_type="自定义" 时生效）
-            custom_model_name: 自定义模型的名称（如 qwen3:8b）
+            model_type: "默认" 使用火山方舟 API，"Ollama" 使用本地模型，"Deepseek" 使用 Deepseek API
+            custom_model_url: Ollama API 地址（仅 model_type="Ollama" 时生效）
+            custom_model_name: Ollama 模型名称（如 qwen3:8b）
+            deepseek_api_key: Deepseek API 密钥（仅 model_type="Deepseek" 时生效）
+            deepseek_model: Deepseek 模型名称（仅 model_type="Deepseek" 时生效）
             load_history: 是否从磁盘加载历史对话（永久记忆功能）
         """
         # 根据模型类型选择配置
         if model_type == "自定义":
+            model_type = "Ollama"
+
+        if model_type == "Ollama":
             # Ollama 等本地模型，API 路径通常为 http://localhost:11434/v1
             base_url = custom_model_url.rstrip('/')
             if not base_url.endswith('/v1'):
                 base_url += '/v1'
             api_key = "ollama"  # Ollama 不需要真实密钥
             model = custom_model_name
+        elif model_type == "Deepseek":
+            base_url = DEEPSEEK_BASE_URL
+            api_key = deepseek_api_key
+            model = deepseek_model if deepseek_model in DEEPSEEK_MODEL_OPTIONS else DEFAULT_DEEPSEEK_MODEL
         else:
             # 火山方舟（豆包）云端 API
             base_url = self.BASE_URL
@@ -91,6 +114,8 @@ class AIChatManager:
         self.model_type = model_type
         self.custom_model_url = custom_model_url
         self.custom_model_name = custom_model_name
+        self.deepseek_api_key = deepseek_api_key
+        self.deepseek_model = deepseek_model
         self.current_model = model
         self.permanent_memory = load_history  # 永久记忆功能状态
         
