@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLineEdit, QPushButton, QT
 from PyQt6.QtCore import QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 
-from core.app_config import DEFAULT_MODEL, DEFAULT_PRESET_AUDIO_PROBABILITY, DEFAULT_VOCU_ASYNC_MODE, DEFAULT_VOCU_FLASH_MODE, LEGACY_MODEL_MAP, MODEL_OPTIONS
+from core.app_config import DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, DEFAULT_PRESET_AUDIO_PROBABILITY, DEFAULT_VOCU_ASYNC_MODE, DEFAULT_VOCU_FLASH_MODE, DEEPSEEK_MODEL_OPTIONS, LEGACY_MODEL_MAP, MODEL_OPTIONS
 from core.reply_parser import clean_stream_display_text, extract_emotions, history_content_to_text
 from core.resources import AUDIO_DIR, get_qsettings
 from services.ai_manager import AIChatManager
@@ -120,21 +120,34 @@ class ChatWidget(QWidget):
         # 加载模型设置
         qsettings = get_qsettings()
         model_type = qsettings.value("model_type", "默认")
+        if model_type == "自定义":
+            model_type = "Ollama"
         saved_model = LEGACY_MODEL_MAP.get(qsettings.value("model", DEFAULT_MODEL), qsettings.value("model", DEFAULT_MODEL))
         if saved_model not in MODEL_OPTIONS:
             saved_model = DEFAULT_MODEL
         AIChatManager.MODEL = saved_model
         custom_model_url = qsettings.value("custom_model_url", "http://localhost:11434")
         custom_model_name = qsettings.value("custom_model_name", "")
+        deepseek_api_key = qsettings.value("deepseek_api_key", "")
+        deepseek_model = qsettings.value("deepseek_model", DEFAULT_DEEPSEEK_MODEL)
+        if deepseek_model not in DEEPSEEK_MODEL_OPTIONS:
+            deepseek_model = DEFAULT_DEEPSEEK_MODEL
         
         # 加载永久记忆设置
         self.permanent_memory = qsettings.value("permanent_memory", False, type=bool)
         print(f"[初始化] 永久记忆功能: {'启用' if self.permanent_memory else '禁用'}")
         
         # 初始化AI管理器（不加载历史，延迟加载）
-        self.ai_manager = AIChatManager(model_type, custom_model_url, custom_model_name, load_history=False)
+        self.ai_manager = AIChatManager(
+            model_type=model_type,
+            custom_model_url=custom_model_url,
+            custom_model_name=custom_model_name,
+            deepseek_api_key=deepseek_api_key,
+            deepseek_model=deepseek_model,
+            load_history=False,
+        )
         saved_key = AIChatManager.load_api_key()
-        if saved_key and model_type != "自定义":
+        if saved_key and model_type == "默认":
             self.ai_manager.API_KEY = saved_key
             from openai import OpenAI
             self.ai_manager.client = OpenAI(
@@ -142,8 +155,10 @@ class ChatWidget(QWidget):
                 api_key=saved_key
             )
             print(f"[初始化] 已加载保存的API密钥")
-        elif model_type == "自定义":
-            print(f"[初始化] 使用自定义模型: {custom_model_name} at {custom_model_url}")
+        elif model_type == "Ollama":
+            print(f"[初始化] 使用 Ollama 模型: {custom_model_name} at {custom_model_url}")
+        elif model_type == "Deepseek":
+            print(f"[初始化] 使用 Deepseek 模型: {deepseek_model}")
         
         # 延迟加载对话历史（主窗口显示后）
         if self.permanent_memory:

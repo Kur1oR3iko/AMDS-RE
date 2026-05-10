@@ -21,6 +21,8 @@ from PyQt6.QtWidgets import (
 )
 
 from core.app_config import (
+    DEEPSEEK_MODEL_OPTIONS,
+    DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_MODEL,
     DEFAULT_PRESET_AUDIO_PROBABILITY,
     DEFAULT_VOCU_ASYNC_MODE,
@@ -112,9 +114,15 @@ class SettingsDialog(QDialog):
 
         qsettings = get_qsettings()
         current_model_type = qsettings.value("model_type", "默认")
+        if current_model_type == "自定义":
+            current_model_type = "Ollama"
         current_model = LEGACY_MODEL_MAP.get(qsettings.value("model", DEFAULT_MODEL), DEFAULT_MODEL)
         current_custom_url = qsettings.value("custom_model_url", "http://localhost:11434")
         current_custom_name = qsettings.value("custom_model_name", "")
+        current_deepseek_api_key = qsettings.value("deepseek_api_key", "")
+        current_deepseek_model = qsettings.value("deepseek_model", DEFAULT_DEEPSEEK_MODEL)
+        if current_deepseek_model not in DEEPSEEK_MODEL_OPTIONS:
+            current_deepseek_model = DEFAULT_DEEPSEEK_MODEL
         preset_probability = max(
             0,
             min(100, qsettings.value("preset_audio_probability", DEFAULT_PRESET_AUDIO_PROBABILITY, type=int)),
@@ -143,28 +151,45 @@ class SettingsDialog(QDialog):
         model_layout.setVerticalSpacing(8)
 
         self.model_type_combo = QComboBox()
-        self.model_type_combo.addItems(["默认", "自定义"])
-        self.model_type_combo.setCurrentText(current_model_type if current_model_type in ["默认", "自定义"] else "默认")
+        self.model_type_combo.addItems(["默认", "Ollama", "Deepseek"])
+        self.model_type_combo.setCurrentText(
+            current_model_type if current_model_type in ["默认", "Ollama", "Deepseek"] else "默认"
+        )
         model_layout.addWidget(QLabel("模型类型:"), 0, 0)
         model_layout.addWidget(self.model_type_combo, 0, 1)
 
         self.model_combo = QComboBox()
         self.model_combo.addItems(MODEL_OPTIONS)
         self.model_combo.setCurrentText(current_model if current_model in MODEL_OPTIONS else DEFAULT_MODEL)
-        model_layout.addWidget(QLabel("默认模型:"), 1, 0)
+        self.model_label = QLabel("默认模型:")
+        model_layout.addWidget(self.model_label, 1, 0)
         model_layout.addWidget(self.model_combo, 1, 1)
 
         self.custom_model_url = QLineEdit(current_custom_url)
-        self.custom_model_url.setPlaceholderText("输入自定义模型 URL，例如 http://localhost:11434")
-        self.custom_url_label = QLabel("自定义模型 URL:")
+        self.custom_model_url.setPlaceholderText("输入 Ollama URL，例如 http://localhost:11434")
+        self.custom_url_label = QLabel("Ollama URL:")
         model_layout.addWidget(self.custom_url_label, 2, 0)
         model_layout.addWidget(self.custom_model_url, 2, 1)
 
         self.custom_model_name = QLineEdit(current_custom_name)
-        self.custom_model_name.setPlaceholderText("输入自定义模型名称，例如 qwen3:8b")
-        self.custom_name_label = QLabel("自定义模型名称:")
+        self.custom_model_name.setPlaceholderText("输入 Ollama 模型名称，例如 qwen3:8b")
+        self.custom_name_label = QLabel("Ollama 模型名称:")
         model_layout.addWidget(self.custom_name_label, 3, 0)
         model_layout.addWidget(self.custom_model_name, 3, 1)
+
+        self.deepseek_api_key_label = QLabel("Deepseek API 密钥:")
+        self.deepseek_api_key_input = QLineEdit(current_deepseek_api_key)
+        self.deepseek_api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.deepseek_api_key_input.setPlaceholderText("输入 Deepseek API 密钥")
+        model_layout.addWidget(self.deepseek_api_key_label, 4, 0)
+        model_layout.addWidget(self.deepseek_api_key_input, 4, 1)
+
+        self.deepseek_model_combo = QComboBox()
+        self.deepseek_model_combo.addItems(DEEPSEEK_MODEL_OPTIONS)
+        self.deepseek_model_combo.setCurrentText(current_deepseek_model)
+        self.deepseek_model_label = QLabel("Deepseek 模型:")
+        model_layout.addWidget(self.deepseek_model_label, 5, 0)
+        model_layout.addWidget(self.deepseek_model_combo, 5, 1)
         layout.addLayout(model_layout)
 
         self.api_key_label = QLabel("AI API 密钥:")
@@ -294,14 +319,23 @@ class SettingsDialog(QDialog):
         self._update_audio_visibility()
 
     def _update_model_visibility(self):
-        is_custom = self.model_type_combo.currentText() == "自定义"
-        self.model_combo.setVisible(not is_custom)
-        self.custom_url_label.setVisible(is_custom)
-        self.custom_model_url.setVisible(is_custom)
-        self.custom_name_label.setVisible(is_custom)
-        self.custom_model_name.setVisible(is_custom)
-        self.api_key_label.setVisible(not is_custom)
-        self.api_key_input.setVisible(not is_custom)
+        model_type = self.model_type_combo.currentText()
+        is_default = model_type == "默认"
+        is_ollama = model_type == "Ollama"
+        is_deepseek = model_type == "Deepseek"
+
+        self.model_label.setVisible(is_default)
+        self.model_combo.setVisible(is_default)
+        self.custom_url_label.setVisible(is_ollama)
+        self.custom_model_url.setVisible(is_ollama)
+        self.custom_name_label.setVisible(is_ollama)
+        self.custom_model_name.setVisible(is_ollama)
+        self.deepseek_api_key_label.setVisible(is_deepseek)
+        self.deepseek_api_key_input.setVisible(is_deepseek)
+        self.deepseek_model_label.setVisible(is_deepseek)
+        self.deepseek_model_combo.setVisible(is_deepseek)
+        self.api_key_label.setVisible(is_default)
+        self.api_key_input.setVisible(is_default)
 
     def _update_audio_visibility(self):
         is_audio_enabled = self.audio_mode_checkbox.isChecked()
@@ -393,6 +427,8 @@ class SettingsDialog(QDialog):
             "model": self.model_combo.currentText(),
             "custom_model_url": self.custom_model_url.text().strip(),
             "custom_model_name": self.custom_model_name.text().strip(),
+            "deepseek_api_key": self.deepseek_api_key_input.text().strip(),
+            "deepseek_model": self.deepseek_model_combo.currentText(),
             "vocu_api_key": self.vocu_api_key_input.text().strip(),
             "vocu_voice_id": self.vocu_voice_id_input.text().strip(),
             "audio_mode": self.audio_mode_checkbox.isChecked(),
