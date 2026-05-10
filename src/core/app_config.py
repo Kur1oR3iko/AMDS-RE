@@ -6,6 +6,14 @@
 # 默认使用的豆包模型（火山方舟平台）
 DEFAULT_MODEL = "doubao-seed-2-0-mini-260215"
 
+# Deepseek OpenAI 兼容接口配置
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEFAULT_DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEEPSEEK_MODEL_OPTIONS = [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+]
+
 # 用户可在设置界面选择的模型列表
 MODEL_OPTIONS = [
     "doubao-seed-2-0-mini-260215",
