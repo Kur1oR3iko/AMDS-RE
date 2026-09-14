@@ -1,0 +1,7 @@
+PyQt6>=6.7
+openai>=2.0
+pygame>=2.6
+requests>=2.32
+Pillow>=10.0
+miniaudio>=1.60
+pyinstaller>=6.0

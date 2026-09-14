@@ -4,6 +4,7 @@ dist/
 
 # Config（含 API 密钥，不要提交）
 config/
+模型.txt
 
 # Python
 __pycache__/

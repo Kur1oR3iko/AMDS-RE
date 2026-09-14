@@ -5,6 +5,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap
 
 from core.resources import IMAGES_DIR
+from core.version import APP_VERSION
 
 class SplashScreen(QMainWindow):
     """启动动画窗口 - 使用Logo序列"""
@@ -51,7 +52,7 @@ class SplashScreen(QMainWindow):
         layout.addWidget(self.loading_text)
         
         # 版本信息
-        version = QLabel("v0.3.0")
+        version = QLabel(f"v{APP_VERSION}")
         version.setAlignment(Qt.AlignmentFlag.AlignCenter)
         version.setStyleSheet("""
             QLabel {

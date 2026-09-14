@@ -1,13 +1,16 @@
 """Chat panel widget and audio playback coordination."""
 
+import html
 import random
+from collections import deque
 from pathlib import Path
 
 from PyQt6.QtWidgets import QFileDialog, QHBoxLayout, QLineEdit, QPushButton, QTextEdit, QVBoxLayout, QWidget
 from PyQt6.QtCore import QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 
-from core.app_config import DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, DEFAULT_PRESET_AUDIO_PROBABILITY, DEFAULT_VOCU_ASYNC_MODE, DEFAULT_VOCU_FLASH_MODE, DEEPSEEK_MODEL_OPTIONS, LEGACY_MODEL_MAP, MODEL_OPTIONS
+from core.app_config import DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, DEFAULT_PRESET_AUDIO_PROBABILITY, DEFAULT_RESPONSES_BASE_URL, DEFAULT_RESPONSES_MODEL, DEFAULT_VOCU_ASYNC_MODE, DEFAULT_VOCU_FLASH_MODE, DEFAULT_VOCU_REALTIME_MODE, DEEPSEEK_MODEL_OPTIONS, LEGACY_MODEL_MAP, MODEL_OPTIONS, RESPONSES_PROVIDER_TYPE
+from core.model_config import import_local_model_settings
 from core.reply_parser import clean_stream_display_text, extract_emotions, history_content_to_text
 from core.resources import AUDIO_DIR, get_qsettings
 from services.ai_manager import AIChatManager
@@ -15,6 +18,7 @@ from services.audio_player import AudioPlayer, NetworkStreamPlayer
 from services.voice_dialog import VoiceDialog
 from services.workers import ChatWorker, TypewriterWorker
 from utils.image_utils import to_data_url
+from utils.thread_pool import submit_io
 
 class ChatWidget(QWidget):
     """聊天界面组件"""
@@ -30,6 +34,14 @@ class ChatWidget(QWidget):
         self.permanent_memory = False  # 永久记忆功能
         self._chat_request_active = False
         self._response_started = False
+        self._vocu_audio_queue = deque()
+        self._vocu_audio_active = False
+        self._vocu_audio_token = None
+        self._qt_vocu_started = False
+        self.network_stream_player = None
+        self._prepared_network_player = None
+        self._prepared_network_source = None
+        self._vocu_prefetch_failed_source = None
         self.setup_ui()
     
     def setup_ui(self):
@@ -119,6 +131,8 @@ class ChatWidget(QWidget):
         
         # 加载模型设置
         qsettings = get_qsettings()
+        if import_local_model_settings(qsettings):
+            print("[配置] 已导入本地模型文件（密钥未写入日志）")
         model_type = qsettings.value("model_type", "默认")
         if model_type == "自定义":
             model_type = "Ollama"
@@ -132,6 +146,9 @@ class ChatWidget(QWidget):
         deepseek_model = qsettings.value("deepseek_model", DEFAULT_DEEPSEEK_MODEL)
         if deepseek_model not in DEEPSEEK_MODEL_OPTIONS:
             deepseek_model = DEFAULT_DEEPSEEK_MODEL
+        responses_base_url = qsettings.value("responses_base_url", DEFAULT_RESPONSES_BASE_URL)
+        responses_api_key = qsettings.value("responses_api_key", "")
+        responses_model = qsettings.value("responses_model", DEFAULT_RESPONSES_MODEL)
         
         # 加载永久记忆设置
         self.permanent_memory = qsettings.value("permanent_memory", False, type=bool)
@@ -144,21 +161,29 @@ class ChatWidget(QWidget):
             custom_model_name=custom_model_name,
             deepseek_api_key=deepseek_api_key,
             deepseek_model=deepseek_model,
+            responses_base_url=responses_base_url,
+            responses_api_key=responses_api_key,
+            responses_model=responses_model,
             load_history=False,
         )
+        self.ai_manager.permanent_memory = self.permanent_memory
         saved_key = AIChatManager.load_api_key()
         if saved_key and model_type == "默认":
             self.ai_manager.API_KEY = saved_key
             from openai import OpenAI
             self.ai_manager.client = OpenAI(
                 base_url=self.ai_manager.BASE_URL,
-                api_key=saved_key
+                api_key=saved_key,
+                timeout=60.0,
+                max_retries=1,
             )
             print(f"[初始化] 已加载保存的API密钥")
         elif model_type == "Ollama":
             print(f"[初始化] 使用 Ollama 模型: {custom_model_name} at {custom_model_url}")
         elif model_type == "Deepseek":
             print(f"[初始化] 使用 Deepseek 模型: {deepseek_model}")
+        elif model_type == RESPONSES_PROVIDER_TYPE:
+            print(f"[初始化] 使用 Responses API 模型: {responses_model}")
         
         # 延迟加载对话历史（主窗口显示后）
         if self.permanent_memory:
@@ -201,6 +226,7 @@ class ChatWidget(QWidget):
             self.preset_audio_probability = qsettings.value("preset_audio_probability", DEFAULT_PRESET_AUDIO_PROBABILITY, type=int)
             self.vocu_async_mode = qsettings.value("vocu_async_mode", DEFAULT_VOCU_ASYNC_MODE, type=bool)
             self.vocu_flash_mode = qsettings.value("vocu_flash_mode", DEFAULT_VOCU_FLASH_MODE, type=bool)
+            self.vocu_realtime_mode = qsettings.value("vocu_realtime_mode", DEFAULT_VOCU_REALTIME_MODE, type=bool)
 
             print(f"加载Vocu配置: api_key={'*' * len(vocu_api_key) if vocu_api_key else '空'}, voice_id={self.vocu_voice_id or '空'}, audio_mode={self.audio_mode}, max_tokens={self.max_tokens}, preset_probability={self.preset_audio_probability}, vocu_async_mode={self.vocu_async_mode}, vocu_flash_mode={self.vocu_flash_mode}")
 
@@ -209,6 +235,7 @@ class ChatWidget(QWidget):
                 from services.audiogenerate import VocuAudioGenerator
                 self.audio_generator = VocuAudioGenerator(vocu_api_key)
                 self.audio_available = True
+                submit_io(self.audio_generator.warmup)
                 print(f"已初始化音频生成器")
             else:
                 self.audio_generator = None
@@ -230,6 +257,7 @@ class ChatWidget(QWidget):
             self.preset_audio_probability = DEFAULT_PRESET_AUDIO_PROBABILITY
             self.vocu_async_mode = DEFAULT_VOCU_ASYNC_MODE
             self.vocu_flash_mode = DEFAULT_VOCU_FLASH_MODE
+            self.vocu_realtime_mode = DEFAULT_VOCU_REALTIME_MODE
 
     def attach_image(self):
         """选择图片附件"""
@@ -261,6 +289,7 @@ class ChatWidget(QWidget):
             self.add_message("你", text, "#4169E1")
 
         # 获取所有匹配的预设语音
+        self._pending_user_text = text
         matching_presets = VoiceDialog.get_all_matching_responses(text)
         has_preset = matching_presets and matching_presets != VoiceDialog.RESPONSES["default"]
 
@@ -277,8 +306,8 @@ class ChatWidget(QWidget):
         # 滑块保存的是 0~100 的整数，这里先换成真正的概率值再比较
         preset_probability = max(0, min(100, getattr(self, "preset_audio_probability", DEFAULT_PRESET_AUDIO_PROBABILITY))) / 100
 
-        # 按设置概率使用预设，剩余概率使用AI生成（有图片或启用音频时不使用预设）
-        if has_preset and random.random() < preset_probability and not self.attached_image_path and not enable_audio:
+        # 预设音频是零合成延迟路径，即使开启 Vocu 也应优先按概率使用。
+        if has_preset and random.random() < preset_probability and not self.attached_image_path:
             # 使用AI智能选择最佳预设
             self._use_ai_selected_preset(text, matching_presets)
         else:
@@ -292,6 +321,9 @@ class ChatWidget(QWidget):
     
     def _use_ai_selected_preset(self, user_text: str, available_presets: list):
         """使用AI智能选择预设语音"""
+        if len(available_presets) == 1:
+            self._on_preset_selected(available_presets[0])
+            return
         # 在后台线程中选择预设
         class PresetSelectorWorker(QThread):
             preset_selected = pyqtSignal(str)  # 选中的预设
@@ -364,6 +396,13 @@ class ChatWidget(QWidget):
         max_tokens = getattr(self, 'max_tokens', 200)
         vocu_async_mode = getattr(self, 'vocu_async_mode', DEFAULT_VOCU_ASYNC_MODE)
         vocu_flash_mode = getattr(self, 'vocu_flash_mode', DEFAULT_VOCU_FLASH_MODE)
+        vocu_realtime_mode = getattr(self, 'vocu_realtime_mode', DEFAULT_VOCU_REALTIME_MODE)
+
+        audio_token = object()
+        if enable_audio:
+            self._begin_vocu_audio_sequence(audio_token)
+        else:
+            self._cancel_vocu_audio_sequence()
 
         self.current_worker = ChatWorker(
             self.ai_manager, user_text, image_path,
@@ -372,14 +411,17 @@ class ChatWidget(QWidget):
             enable_audio=enable_audio,
             max_tokens=max_tokens,
             vocu_async_mode=vocu_async_mode,
-            vocu_flash_mode=vocu_flash_mode
+            vocu_flash_mode=vocu_flash_mode,
+            vocu_realtime_mode=vocu_realtime_mode,
         )
         self.current_worker.emotion_ready.connect(self._on_emotion_ready)
         self.current_worker.chunk_ready.connect(self._on_streaming_chunk)
         self.current_worker.response_complete.connect(self._on_ai_streaming_complete)
         self.current_worker.error_occurred.connect(self._on_ai_error)
         self.current_worker.audio_status.connect(self._on_audio_status)
-        self.current_worker.audio_ready.connect(self._on_audio_ready)
+        self.current_worker.audio_ready.connect(
+            lambda source, token=audio_token: self._on_audio_ready(source, token)
+        )
         self.current_worker.japanese_text_ready.connect(self._on_japanese_text_ready)
         self.current_worker.finished.connect(self._restore_input_controls)
         self.current_worker.start()
@@ -419,6 +461,7 @@ class ChatWidget(QWidget):
             return
         print("[输入] 静默看门狗触发，未收到结束信号，执行兜底恢复。")
         self._restore_input_controls()
+        self._pending_user_text = ""
 
     def _update_loading_animation(self):
         """更新加载动画（三个点循环）- 使用QTextCursor精确定位"""
@@ -485,7 +528,7 @@ class ChatWidget(QWidget):
 
         self.current_streaming_text += char
         # 使用HTML插入黑色文本
-        char_escaped = char.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
+        char_escaped = html.escape(char)
         cursor.insertHtml(f'<span style="color: #000000;">{char_escaped}</span>')
 
         # 滚动到底部
@@ -526,7 +569,7 @@ class ChatWidget(QWidget):
 
         self.current_streaming_text += chunk
         # 使用HTML插入黑色文本
-        chunk_escaped = chunk.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
+        chunk_escaped = html.escape(chunk)
         cursor.insertHtml(f'<span style="color: #000000;">{chunk_escaped}</span>')
 
         # 滚动到底部
@@ -541,7 +584,15 @@ class ChatWidget(QWidget):
 
         # 将预设回复添加到AI对话历史，保持上下文连贯
         if hasattr(self, 'ai_manager') and self.ai_manager:
-            self.ai_manager.conversation_history.append({"role": "assistant", "content": full_text})
+            pending_user = getattr(self, "_pending_user_text", "")
+            if pending_user:
+                self.ai_manager.append_message("user", pending_user)
+            self.ai_manager.append_message("assistant", full_text)
+            self.ai_manager.schedule_memory_compaction()
+            self.ai_manager.schedule_fact_extraction(pending_user)
+            if self.permanent_memory:
+                self.ai_manager.save_conversation()
+        self._pending_user_text = ""
 
         self._restore_input_controls()
 
@@ -561,13 +612,16 @@ class ChatWidget(QWidget):
         self._kick_request_watchdog("audio_status")
         print(f"[音频状态] {status}")
 
-    def _on_audio_ready(self, audio_source: str):
+    def _on_audio_ready(self, audio_source: str, token=None):
         """音频准备好，开始播放（支持URL和本地文件）"""
+        if token is not None and token is not self._vocu_audio_token:
+            print("[音频播放] 忽略上一轮回复迟到的音频")
+            return
         self._kick_request_watchdog("audio_ready", 5000)
-        print(f"[音频播放] _on_audio_ready 被调用，音频源: {audio_source}")
+        print("[音频播放] 收到一个可播放音频分段")
         if audio_source:
             if audio_source.startswith('http://') or audio_source.startswith('https://'):
-                print(f"[音频播放] 检测到URL，直接播放")
+                print("[音频播放] 检测到URL，加入顺序播放队列")
             else:
                 print(f"[音频播放] 检测到本地文件，检查文件是否存在: {Path(audio_source).exists()}")
             self.play_vocu_audio(audio_source)
@@ -576,19 +630,147 @@ class ChatWidget(QWidget):
 
     def _stop_vocu_backends(self):
         """停止当前 Vocu 播放后端，避免多个播放器重叠。"""
-        if hasattr(self, "network_stream_player") and self.network_stream_player:
+        for attr in ("local_vocu_player", "player"):
+            player = getattr(self, attr, None)
+            if player and player.isRunning():
+                player.stop()
+                player.wait(500)
+            if attr == "local_vocu_player":
+                self.local_vocu_player = None
+
+        network_players = []
+        if self.network_stream_player:
+            network_players.append(self.network_stream_player)
+        if (
+            self._prepared_network_player
+            and self._prepared_network_player is not self.network_stream_player
+        ):
+            network_players.append(self._prepared_network_player)
+        for network_player in network_players:
             try:
-                self.network_stream_player.stop()
-                self.network_stream_player.wait(500)
+                network_player.stop()
+                network_player.wait(500)
             except Exception as exc:
                 print(f"[网络流播放器] 停止失败: {exc}")
-            self.network_stream_player = None
+        self.network_stream_player = None
+        self._prepared_network_player = None
+        self._prepared_network_source = None
 
         if hasattr(self, "media_player"):
             try:
                 self.media_player.stop()
             except Exception:
                 pass
+
+    def _begin_vocu_audio_sequence(self, token):
+        """开始一轮新的分段语音，旧回复的播放器和队列立即失效。"""
+        self._vocu_audio_token = token
+        self._vocu_audio_queue.clear()
+        self._vocu_audio_active = False
+        self._qt_vocu_started = False
+        self._vocu_prefetch_failed_source = None
+        self._stop_vocu_backends()
+
+    def _cancel_vocu_audio_sequence(self):
+        self._vocu_audio_token = None
+        self._vocu_audio_queue.clear()
+        self._vocu_audio_active = False
+        self._qt_vocu_started = False
+        self._vocu_prefetch_failed_source = None
+        self._stop_vocu_backends()
+
+    def _play_next_vocu_segment(self):
+        if self._vocu_audio_active or not self._vocu_audio_queue:
+            return
+        audio_source = self._vocu_audio_queue.popleft()
+        self._vocu_audio_active = True
+        if (
+            self._prepared_network_player
+            and self._prepared_network_source == audio_source
+        ):
+            player = self._prepared_network_player
+            self._prepared_network_player = None
+            self._prepared_network_source = None
+            self.network_stream_player = player
+            self._connect_active_network_player(player, audio_source)
+            print("[音频播放] 启用已经预连接的下一段")
+            player.activate()
+        else:
+            self._start_vocu_audio_source(audio_source)
+        if self._vocu_prefetch_failed_source == audio_source:
+            self._vocu_prefetch_failed_source = None
+        self._prepare_next_vocu_segment()
+
+    def _finish_vocu_segment(self):
+        self._vocu_audio_active = False
+        QTimer.singleShot(0, self._play_next_vocu_segment)
+
+    def _stream_session(self):
+        return getattr(getattr(self, "audio_generator", None), "stream_session", None)
+
+    def _connect_active_network_player(self, player, audio_source: str):
+        player.playback_started.connect(
+            lambda active_player=player: self._on_network_stream_started(active_player)
+        )
+        player.finished.connect(
+            lambda active_player=player: self._on_network_stream_finished(active_player)
+        )
+        player.error.connect(
+            lambda error_msg, source=audio_source, active_player=player:
+            self._on_network_stream_error(active_player, source, error_msg)
+        )
+
+    def _prepare_next_vocu_segment(self):
+        """预连接队首网络流；等当前段结束后再真正播放。"""
+        if (
+            not self._vocu_audio_active
+            or self._prepared_network_player
+            or not self._vocu_audio_queue
+        ):
+            return
+        audio_source = self._vocu_audio_queue[0]
+        if (
+            not audio_source.startswith(("http://", "https://"))
+            or audio_source == self._vocu_prefetch_failed_source
+        ):
+            return
+
+        player = NetworkStreamPlayer(
+            audio_source,
+            session=self._stream_session(),
+            start_paused=True,
+        )
+        self._prepared_network_player = player
+        self._prepared_network_source = audio_source
+        player.prepared.connect(
+            lambda prepared_player=player: self._on_network_stream_prepared(prepared_player)
+        )
+        player.error.connect(
+            lambda error_msg, source=audio_source, prepared_player=player:
+            self._on_prepared_network_error(prepared_player, source, error_msg)
+        )
+        player.finished.connect(
+            lambda prepared_player=player: self._on_prepared_network_finished(prepared_player)
+        )
+        print("[音频播放] 提前连接下一段网络流")
+        player.start()
+
+    def _on_network_stream_prepared(self, player):
+        if self._prepared_network_player is player:
+            print("[音频播放] 下一段首帧已预备")
+
+    def _on_prepared_network_error(self, player, audio_source: str, error_msg: str):
+        if self._prepared_network_player is not player:
+            return
+        print(f"[音频播放] 下一段预连接失败，将在切换时重试。error={error_msg}")
+        self._vocu_prefetch_failed_source = audio_source
+        self._prepared_network_player = None
+        self._prepared_network_source = None
+
+    def _on_prepared_network_finished(self, player):
+        if self._prepared_network_player is player:
+            self._prepared_network_player = None
+            self._prepared_network_source = None
 
     def _on_network_stream_started(self, player):
         if getattr(self, "network_stream_player", None) is not player:
@@ -607,6 +789,7 @@ class ChatWidget(QWidget):
             print("[表情] 网络流播放结束，停止说话动画")
             self.character.stop_speaking()
         self.network_stream_player = None
+        self._finish_vocu_segment()
 
     def _on_network_stream_error(self, player, audio_source: str, error_msg: str):
         if getattr(self, "network_stream_player", None) is not player:
@@ -614,21 +797,12 @@ class ChatWidget(QWidget):
             return
         print(f"[网络流播放器] 播放失败，准备回退。error={error_msg}")
         self.network_stream_player = None
-
-        cached_audio = None
-        if (
-            audio_source.startswith('http://') or audio_source.startswith('https://')
-        ) and getattr(self, "audio_generator", None):
-            cached_audio = self.audio_generator.cache_audio_to_local(audio_source)
-
-        if cached_audio:
-            print(f"[网络流播放器] 回退到本地缓存播放: {cached_audio}")
-            self.play_vocu_audio(cached_audio)
-            return
-
         if audio_source.startswith('http://') or audio_source.startswith('https://'):
-            print("[网络流播放器] 本地缓存失败，回退到 Qt URL 播放")
+            # 下载完整文件会再次阻塞主线程；直接交给 Qt 做独立网络回退。
+            print("[网络流播放器] 回退到 Qt URL 播放")
             self._play_vocu_audio_with_qt(audio_source)
+        else:
+            self._finish_vocu_segment()
 
     def _play_vocu_audio_with_qt(self, audio_source: str):
         """作为兜底方案，使用 Qt 多媒体播放远程 URL。"""
@@ -641,19 +815,22 @@ class ChatWidget(QWidget):
                 self.media_player.setBufferDuration(100)
                 print("[音频播放] Qt 回退播放器已设置最小缓冲时长")
             self.media_player.playbackStateChanged.connect(self._on_playback_state_changed)
+            self.media_player.errorOccurred.connect(self._on_qt_vocu_error)
 
         if hasattr(self, 'character') and self.character:
             print("[表情] 准备在 Qt 回退播放时启动说话动画")
 
+        self._qt_vocu_started = False
         self.media_player.setSource(QUrl(audio_source))
         self.media_player.play()
-        print(f"[音频播放] Qt 回退直接播放URL: {audio_source}")
+        print("[音频播放] Qt 回退已提交远程URL")
 
     def _on_playback_state_changed(self, state):
         """播放状态变化时处理"""
         print(f"[播放状态] 状态变化: {state}, PlayingState: {QMediaPlayer.PlaybackState.PlayingState}")
         
         if state == QMediaPlayer.PlaybackState.PlayingState:
+            self._qt_vocu_started = True
             # 音频开始播放，启动说话动画
             if hasattr(self, 'character') and self.character and not self.character.is_speaking:
                 print(f"[表情] 音频开始播放，启动说话动画")
@@ -663,6 +840,14 @@ class ChatWidget(QWidget):
             if hasattr(self, 'character') and self.character and self.character.is_speaking:
                 print(f"[表情] 音频停止播放，停止说话动画")
                 self.character.stop_speaking()
+            if self._qt_vocu_started:
+                self._qt_vocu_started = False
+                self._finish_vocu_segment()
+
+    def _on_qt_vocu_error(self, _error, error_string=""):
+        print(f"[音频播放] Qt 回退失败: {error_string}")
+        self._qt_vocu_started = False
+        self._finish_vocu_segment()
 
     def _on_japanese_text_ready(self, japanese_text: str):
         """日语文本准备好，显示在人物下方"""
@@ -708,6 +893,7 @@ class ChatWidget(QWidget):
         self._restore_input_controls()
 
         self.current_streaming_text = ""
+        self._pending_user_text = ""
         
         # 保存对话历史（如果启用了永久记忆）
         if self.permanent_memory and self.ai_manager:
@@ -727,7 +913,7 @@ class ChatWidget(QWidget):
         try:
             cursor = self.chat_history.textCursor()
             cursor.movePosition(cursor.MoveOperation.End)
-            error_escaped = self.current_streaming_text.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
+            error_escaped = html.escape(self.current_streaming_text)
             cursor.insertHtml(f'<span style="color: #FF0000;">{error_escaped}</span>')
             # 滚动到底部
             scrollbar = self.chat_history.verticalScrollBar()
@@ -736,6 +922,7 @@ class ChatWidget(QWidget):
             print(f"更新错误显示失败: {e}")
 
         self._restore_input_controls()
+        self._pending_user_text = ""
 
     def _set_input_controls_enabled(self, enabled: bool, reason: str = ""):
         """统一管理输入控件状态，便于排查卡死/未恢复问题。"""
@@ -874,6 +1061,7 @@ class ChatWidget(QWidget):
         """播放音频 - 自动设置表情和动画"""
         audio_path = AUDIO_DIR / f"{audio_name}.ogg"
         if audio_path.exists():
+            self._cancel_vocu_audio_sequence()
             # 自动设置表情
             if character:
                 japanese_text = VoiceDialog.get_japanese_text_for_audio(audio_name)
@@ -891,44 +1079,45 @@ class ChatWidget(QWidget):
             self.player.start()
     
     def play_vocu_audio(self, audio_source: str):
-        """播放Vocu生成的音频（支持URL和本地文件）"""
-        try:
-            self._stop_vocu_backends()
+        """将 Vocu 分段加入队列，上一段结束后自动衔接。"""
+        if not audio_source:
+            return
+        if self._vocu_audio_token is None:
+            self._begin_vocu_audio_sequence(object())
+        self._vocu_audio_queue.append(audio_source)
+        self._play_next_vocu_segment()
+        self._prepare_next_vocu_segment()
 
+    def _start_vocu_audio_source(self, audio_source: str):
+        """立即启动队首的单个音频源。"""
+        try:
             if audio_source.startswith('http://') or audio_source.startswith('https://'):
-                print(f"[音频播放] 优先使用专用网络流播放器: {audio_source}")
-                self.network_stream_player = NetworkStreamPlayer(audio_source)
-                self.network_stream_player.playback_started.connect(
-                    lambda player=self.network_stream_player: self._on_network_stream_started(player)
+                print("[音频播放] 使用专用低延迟网络流播放器")
+                self.network_stream_player = NetworkStreamPlayer(
+                    audio_source,
+                    session=self._stream_session(),
                 )
-                self.network_stream_player.finished.connect(
-                    lambda player=self.network_stream_player: self._on_network_stream_finished(player)
-                )
-                self.network_stream_player.error.connect(
-                    lambda error_msg, source=audio_source, player=self.network_stream_player:
-                    self._on_network_stream_error(player, source, error_msg)
-                )
+                self._connect_active_network_player(self.network_stream_player, audio_source)
                 self.network_stream_player.start()
             else:
-                import pygame
-                pygame.mixer.init()
-                pygame.mixer.music.load(str(audio_source))
-                pygame.mixer.music.play()
-                
                 print(f"[音频播放] 播放本地文件: {audio_source}")
-                
+                self.local_vocu_player = AudioPlayer(audio_source)
                 if hasattr(self, 'character') and self.character:
-                    print(f"[表情] 开始说话动画")
-                    self.character.start_speaking()
-                def check_audio_done():
-                    if not pygame.mixer.music.get_busy():
-                        print(f"[表情] 停止说话动画")
-                        if hasattr(self, 'character') and self.character:
-                            self.character.stop_speaking()
-                    else:
-                        QTimer.singleShot(100, check_audio_done)
-                QTimer.singleShot(100, check_audio_done)
+                    self.local_vocu_player.started.connect(self.character.start_speaking)
+                self.local_vocu_player.finished.connect(
+                    lambda player=self.local_vocu_player: self._on_local_vocu_finished(player)
+                )
+                self.local_vocu_player.start()
         except Exception as e:
             print(f"播放Vocu音频失败: {e}")
             import traceback
             traceback.print_exc()
+            self._finish_vocu_segment()
+
+    def _on_local_vocu_finished(self, player):
+        if getattr(self, "local_vocu_player", None) is not player:
+            return
+        self.local_vocu_player = None
+        if hasattr(self, 'character') and self.character and self.character.is_speaking:
+            self.character.stop_speaking()
+        self._finish_vocu_segment()

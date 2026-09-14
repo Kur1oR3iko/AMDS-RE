@@ -14,6 +14,11 @@ DEEPSEEK_MODEL_OPTIONS = [
     "deepseek-v4-pro",
 ]
 
+# OpenAI Responses API 兼容端点（密钥只从本地设置读取，不写入源码）
+RESPONSES_PROVIDER_TYPE = "Responses API"
+DEFAULT_RESPONSES_BASE_URL = "https://newapi.caner.hk/v1"
+DEFAULT_RESPONSES_MODEL = "gpt-5.6-luna"
+
 # 用户可在设置界面选择的模型列表
 MODEL_OPTIONS = [
     "doubao-seed-2-0-mini-260215",
@@ -33,5 +38,14 @@ DEFAULT_PRESET_AUDIO_PROBABILITY = 30
 # Vocu 异步生成模式默认关闭（通常需要付费会员才能使用）
 DEFAULT_VOCU_ASYNC_MODE = False
 
+# 优先调用 Vocu simple-generate 的 streamUrl，失败再回退到任务接口
+DEFAULT_VOCU_REALTIME_MODE = True
+
 # Vocu flash 低延迟模式默认关闭：可能更快，但音色稳定性可能下降
 DEFAULT_VOCU_FLASH_MODE = False
+
+# 记忆系统：近期原文 + 滚动摘要，避免永久记忆时无限扩张上下文
+DEFAULT_RECENT_MEMORY_MESSAGES = 24
+DEFAULT_CONTEXT_MAX_CHARS = 24000
+DEFAULT_MEMORY_SUMMARY_TRIGGER = 36
+DEFAULT_MEMORY_KEEP_RECENT = 20

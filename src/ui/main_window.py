@@ -24,9 +24,13 @@ from core.app_config import (
     DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_MODEL,
     DEFAULT_PRESET_AUDIO_PROBABILITY,
+    DEFAULT_RESPONSES_BASE_URL,
+    DEFAULT_RESPONSES_MODEL,
     DEFAULT_VOCU_ASYNC_MODE,
     DEFAULT_VOCU_FLASH_MODE,
+    DEFAULT_VOCU_REALTIME_MODE,
     LEGACY_MODEL_MAP,
+    RESPONSES_PROVIDER_TYPE,
 )
 from core.resources import AUDIO_DIR, IMAGES_DIR, get_config_dir, get_qsettings
 from services.ai_manager import AIChatManager
@@ -287,9 +291,13 @@ class MainWindow(QMainWindow):
             custom_model_name=settings["custom_model_name"],
             deepseek_api_key=settings["deepseek_api_key"],
             deepseek_model=settings["deepseek_model"],
+            responses_base_url=settings["responses_base_url"],
+            responses_api_key=settings["responses_api_key"],
+            responses_model=settings["responses_model"],
         )
         self.chat.ai_manager.API_KEY = effective_api_key
         self.chat.ai_manager.conversation_history = current_history
+        self.chat.ai_manager.memory.restore_state(len(current_history))
 
         if settings["model_type"] == "Ollama":
             print(
@@ -298,11 +306,9 @@ class MainWindow(QMainWindow):
             )
         elif settings["model_type"] == "Deepseek":
             print(f"[设置] 已切换到 Deepseek 模型: {settings['deepseek_model']}")
+        elif settings["model_type"] == RESPONSES_PROVIDER_TYPE:
+            print(f"[设置] 已切换到 Responses API 模型: {settings['responses_model']}")
         else:
-            self.chat.ai_manager.client = OpenAI(
-                base_url=self.chat.ai_manager.BASE_URL,
-                api_key=self.chat.ai_manager.API_KEY or "missing-api-key",
-            )
             print(f"[设置] 已切换到默认模型: {settings['model']}")
 
         old_permanent_memory = self.chat.permanent_memory
@@ -323,6 +329,10 @@ class MainWindow(QMainWindow):
             settings["preset_audio_probability"],
             settings["vocu_async_mode"],
             settings["vocu_flash_mode"],
+            settings["responses_base_url"],
+            settings["responses_api_key"],
+            settings["responses_model"],
+            settings["vocu_realtime_mode"],
         )
 
         self.chat.permanent_memory = new_permanent_memory
@@ -342,7 +352,7 @@ class MainWindow(QMainWindow):
         """Confirm disabling permanent memory and clear history if accepted."""
         msg_box = QMessageBox(self)
         msg_box.setWindowTitle("确认关闭永久记忆")
-        msg_box.setText("关闭永久记忆会清除当前保存的聊天记录，确定继续吗？")
+        msg_box.setText("关闭永久记忆会清除聊天记录、滚动摘要和重要事实，确定继续吗？")
 
         confirm_button = msg_box.addButton("确认关闭", QMessageBox.ButtonRole.AcceptRole)
         msg_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
@@ -375,6 +385,10 @@ class MainWindow(QMainWindow):
             settings["preset_audio_probability"],
             settings["vocu_async_mode"],
             settings["vocu_flash_mode"],
+            settings["responses_base_url"],
+            settings["responses_api_key"],
+            settings["responses_model"],
+            settings["vocu_realtime_mode"],
         )
 
     def _save_api_key(self, api_key: str):
@@ -413,6 +427,10 @@ class MainWindow(QMainWindow):
         preset_audio_probability: int = DEFAULT_PRESET_AUDIO_PROBABILITY,
         vocu_async_mode: bool = DEFAULT_VOCU_ASYNC_MODE,
         vocu_flash_mode: bool = DEFAULT_VOCU_FLASH_MODE,
+        responses_base_url: str = DEFAULT_RESPONSES_BASE_URL,
+        responses_api_key: str = "",
+        responses_model: str = DEFAULT_RESPONSES_MODEL,
+        vocu_realtime_mode: bool = DEFAULT_VOCU_REALTIME_MODE,
     ):
         """Save Vocu-related settings into QSettings."""
         try:
@@ -431,6 +449,10 @@ class MainWindow(QMainWindow):
             qsettings.setValue("preset_audio_probability", preset_audio_probability)
             qsettings.setValue("vocu_async_mode", vocu_async_mode)
             qsettings.setValue("vocu_flash_mode", vocu_flash_mode)
+            qsettings.setValue("responses_base_url", responses_base_url)
+            qsettings.setValue("responses_api_key", responses_api_key)
+            qsettings.setValue("responses_model", responses_model)
+            qsettings.setValue("vocu_realtime_mode", vocu_realtime_mode)
             qsettings.sync()
             print(
                 f"Vocu 配置已保存: api_key={'*' * len(api_key) if api_key else '空'}, "

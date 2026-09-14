@@ -14,6 +14,8 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR = os.path.join(PROJECT_ROOT, "src")
 ASSETS_DIR = os.path.join(PROJECT_ROOT, "assets")
 ENTRY = os.path.join(SRC_DIR, "main.py")
+sys.path.insert(0, SRC_DIR)
+from core.version import APP_VERSION
 ICON = os.path.join(ASSETS_DIR, "images", "icon.ico")
 
 APP_NAME = "AMDS"
@@ -25,14 +27,16 @@ DEPENDENCIES = [
     "pygame",
     "requests",
     "Pillow",
+    "miniaudio",
     "pyinstaller",
 ]
 
 
 def ensure_deps():
     missing = []
+    import_names = {"Pillow": "PIL", "pyinstaller": "PyInstaller"}
     for pkg in DEPENDENCIES:
-        mod = "PIL" if pkg == "Pillow" else pkg
+        mod = import_names.get(pkg, pkg)
         try:
             __import__(mod)
         except ImportError:
@@ -59,6 +63,23 @@ def clean():
 
 def build():
     os.makedirs(DIST_DIR, exist_ok=True)
+    version_dir = os.path.join(PROJECT_ROOT, "build")
+    os.makedirs(version_dir, exist_ok=True)
+    version_file = os.path.join(version_dir, "version_info.txt")
+    version_tuple = tuple(int(part) for part in APP_VERSION.split(".")) + (0,)
+    with open(version_file, "w", encoding="utf-8") as handle:
+        handle.write(f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={version_tuple!r}, prodvers={version_tuple!r},
+    mask=0x3f, flags=0x0, OS=0x40004, fileType=0x1, subtype=0x0, date=(0, 0)),
+  kids=[StringFileInfo([StringTable('040904B0', [
+    StringStruct('FileDescription', 'AMDS Amadeus'),
+    StringStruct('FileVersion', '{APP_VERSION}'),
+    StringStruct('ProductName', 'AMDS'),
+    StringStruct('ProductVersion', '{APP_VERSION}'),
+    StringStruct('OriginalFilename', 'AMDS.exe')
+  ])]), VarFileInfo([VarStruct('Translation', [1033, 1200])])]
+)
+""")
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
@@ -68,6 +89,7 @@ def build():
         "--windowed",
         f"--name={APP_NAME}",
         f"--icon={ICON}",
+        f"--version-file={version_file}",
         f"--distpath={DIST_DIR}",
         f"--workpath={os.path.join(PROJECT_ROOT, 'build')}",
         f"--specpath={PROJECT_ROOT}",
@@ -79,6 +101,7 @@ def build():
         "--hidden-import=pygame",
         "--hidden-import=PyQt6",
         "--hidden-import=PyQt6.QtMultimedia",
+        "--hidden-import=miniaudio",
 
         # 入口
         ENTRY,

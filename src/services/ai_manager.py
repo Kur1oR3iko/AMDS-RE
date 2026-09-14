@@ -7,6 +7,7 @@ AI 对话管理器
 import json
 import random
 import re
+import threading
 
 from openai import OpenAI
 
@@ -15,16 +16,19 @@ from core.app_config import (
     DEEPSEEK_MODEL_OPTIONS,
     DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_MODEL,
+    DEFAULT_RESPONSES_BASE_URL,
+    DEFAULT_RESPONSES_MODEL,
     LEGACY_MODEL_MAP,
+    RESPONSES_PROVIDER_TYPE,
 )
 from core.character_skill import build_prompt_bundle
 from core.reply_parser import (
     format_image_history_text,
     normalize_emotion,
     parse_bilingual_response,
-    sanitize_history_messages,
 )
 from core.resources import get_config_dir, get_qsettings
+from services.conversation_memory import ConversationMemory
 from services.voice_dialog import VoiceDialog
 from utils.image_utils import encode_image_data_url
 from utils.thread_pool import submit_io
@@ -71,12 +75,16 @@ class AIChatManager:
         custom_model_name="",
         deepseek_api_key="",
         deepseek_model=DEFAULT_DEEPSEEK_MODEL,
+        responses_base_url=DEFAULT_RESPONSES_BASE_URL,
+        responses_api_key="",
+        responses_model=DEFAULT_RESPONSES_MODEL,
         load_history=False,
     ):
         """
         初始化 AI 对话管理器
         Args:
-            model_type: "默认" 使用火山方舟 API，"Ollama" 使用本地模型，"Deepseek" 使用 Deepseek API
+            model_type: "默认" 使用火山方舟 API，"Ollama" 使用本地模型，
+                "Deepseek" 使用 Deepseek API，"Responses API" 使用 OpenAI Responses 协议
             custom_model_url: Ollama API 地址（仅 model_type="Ollama" 时生效）
             custom_model_name: Ollama 模型名称（如 qwen3:8b）
             deepseek_api_key: Deepseek API 密钥（仅 model_type="Deepseek" 时生效）
@@ -87,6 +95,7 @@ class AIChatManager:
         if model_type == "自定义":
             model_type = "Ollama"
 
+        self.api_mode = "chat_completions"
         if model_type == "Ollama":
             # Ollama 等本地模型，API 路径通常为 http://localhost:11434/v1
             base_url = custom_model_url.rstrip('/')
@@ -98,6 +107,11 @@ class AIChatManager:
             base_url = DEEPSEEK_BASE_URL
             api_key = deepseek_api_key
             model = deepseek_model if deepseek_model in DEEPSEEK_MODEL_OPTIONS else DEFAULT_DEEPSEEK_MODEL
+        elif model_type == RESPONSES_PROVIDER_TYPE:
+            base_url = (responses_base_url or DEFAULT_RESPONSES_BASE_URL).rstrip("/")
+            api_key = responses_api_key or "missing-api-key"
+            model = responses_model or DEFAULT_RESPONSES_MODEL
+            self.api_mode = "responses"
         else:
             # 火山方舟（豆包）云端 API
             base_url = self.BASE_URL
@@ -107,7 +121,9 @@ class AIChatManager:
         
         self.client = OpenAI(
             base_url=base_url,
-            api_key=api_key
+            api_key=api_key,
+            timeout=60.0,
+            max_retries=1,
         )
         self.conversation_history = []
         # 保存当前模型配置
@@ -116,12 +132,183 @@ class AIChatManager:
         self.custom_model_name = custom_model_name
         self.deepseek_api_key = deepseek_api_key
         self.deepseek_model = deepseek_model
+        self.responses_base_url = responses_base_url
+        self.responses_api_key = responses_api_key
+        self.responses_model = responses_model
         self.current_model = model
         self.permanent_memory = load_history  # 永久记忆功能状态
+        self.memory = ConversationMemory(get_config_dir())
+        self._history_lock = threading.RLock()
+        self._memory_future = None
+        self._fact_futures = set()
         
         # 加载对话历史（如果启用）
         if load_history:
             self.load_conversation()
+
+    def stream_text(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        max_tokens: int,
+        temperature: float = 0.8,
+    ):
+        """用统一生成器适配 Chat Completions 与 Responses API。"""
+        if self.api_mode == "responses":
+            instructions, response_input = self._to_responses_input(system_prompt, messages)
+            response = self.client.responses.create(
+                model=self.current_model,
+                instructions=instructions,
+                input=response_input,
+                max_output_tokens=max(16, int(max_tokens)),
+                stream=True,
+            )
+            for event in response:
+                if getattr(event, "type", "") == "response.output_text.delta":
+                    delta = getattr(event, "delta", "")
+                    if delta:
+                        yield delta
+            return
+
+        kwargs = {
+            "model": self.current_model,
+            "messages": [{"role": "system", "content": system_prompt}] + messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "stream": True,
+        }
+        # 火山方舟支持该参数；其他 OpenAI 兼容端点不一定支持。
+        if self.model_type == "默认":
+            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        response = self.client.chat.completions.create(**kwargs)
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
+    def complete_text(
+        self,
+        system_prompt: str,
+        messages: list[dict],
+        max_tokens: int,
+        temperature: float = 0.7,
+    ) -> str:
+        return "".join(self.stream_text(system_prompt, messages, max_tokens, temperature)).strip()
+
+    def context_messages(self) -> list[dict]:
+        with self._history_lock:
+            history = list(self.conversation_history)
+        return self.memory.build_context(history, self.permanent_memory)
+
+    def append_message(self, role: str, content) -> None:
+        with self._history_lock:
+            self.conversation_history.append({"role": role, "content": content})
+        if role == "user" and self.permanent_memory and isinstance(content, str):
+            action, changed = self.memory.capture_explicit_instruction(content)
+            if action != "none":
+                print(f"[记忆] 已处理用户{'记住' if action == 'remember' else '忘记'}指令，变更 {changed} 条事实")
+
+    def schedule_fact_extraction(self, user_text: str) -> None:
+        """仅对可能包含稳定信息的消息做后台结构化提取。"""
+        if not self.permanent_memory or not self.memory.looks_like_stable_fact(user_text):
+            return
+
+        def extract():
+            try:
+                existing = self.memory.get_facts()
+                existing_text = "\n".join(
+                    f"- key={fact.get('key') or '无'}; {fact.get('content', '')}"
+                    for fact in existing[-80:]
+                ) or "（无）"
+                prompt = """你是长期记忆事实提取器。只提取用户明确陈述、未来多轮对话仍有价值的稳定信息。
+可保留：姓名/称呼、生日、长期偏好与禁忌、职业、重要关系、长期目标、用户强调的约定。
+必须忽略：当下情绪、一次性问题、猜测、AI 回复、用户没有明说的结论。
+每条事实使用稳定 key，例如 profile.name、profile.birthday、preference.food.cilantro、goal.current_project。
+新信息更正旧信息时应复用同一 key。
+只输出严格 JSON：{"facts":[{"key":"...","category":"身份|偏好|目标|关系|约定|其他","content":"用户……"}]}。无事实时输出 {"facts":[]}。"""
+                request = f"现有事实：\n{existing_text}\n\n用户新消息：\n{user_text}"
+                raw = self.complete_text(prompt, [{"role": "user", "content": request}], 500, 0.1)
+                payload_match = re.search(r"\{.*\}", raw, re.DOTALL)
+                payload = json.loads(payload_match.group(0)) if payload_match else {}
+                facts = payload.get("facts", []) if isinstance(payload, dict) else []
+                changed = 0
+                for fact in facts[:8]:
+                    if not isinstance(fact, dict):
+                        continue
+                    changed += int(self.memory.upsert_fact(
+                        str(fact.get("content", "")),
+                        str(fact.get("category", "其他")),
+                        "auto",
+                        str(fact.get("key", "")),
+                    ))
+                if changed:
+                    print(f"[记忆] 已后台提取 {changed} 条重要事实")
+            except Exception as exc:
+                print(f"[记忆] 事实提取失败: {exc}")
+
+        future = submit_io(extract)
+        self._fact_futures.add(future)
+        future.add_done_callback(lambda item: self._fact_futures.discard(item))
+
+    def schedule_memory_compaction(self) -> None:
+        """在回复已显示后后台压缩早期记忆，不阻塞聊天界面。"""
+        if not self.permanent_memory:
+            return
+        with self._history_lock:
+            history = list(self.conversation_history)
+        if not self.memory.needs_compaction(len(history)):
+            return
+        if self._memory_future is not None and not self._memory_future.done():
+            return
+
+        def compact():
+            try:
+                if self.memory.compact(history, self._summarize_memory):
+                    print("[记忆] 早期对话已压缩为滚动摘要")
+            except Exception as exc:
+                print(f"[记忆] 后台压缩失败: {exc}")
+
+        self._memory_future = submit_io(compact)
+
+    def _summarize_memory(self, previous_summary: str, transcript: str) -> str:
+        prompt = """你是对话记忆整理器。请更新一份简洁、事实性的长期记忆。
+保留：用户的称呼、偏好、长期目标、重要经历、与角色的关系变化、尚未解决的事项。
+丢弃：寒暄、重复句子、推理过程、临时性的界面状态。
+不得臆造；如果新信息与旧摘要冲突，以新对话为准。只输出更新后的中文摘要。"""
+        user_text = f"旧摘要：\n{previous_summary or '（无）'}\n\n新对话：\n{transcript}"
+        return self.complete_text(prompt, [{"role": "user", "content": user_text}], 800, 0.2)
+
+    @staticmethod
+    def _to_responses_input(system_prompt: str, messages: list[dict]) -> tuple[str, list[dict]]:
+        instructions = [system_prompt]
+        converted = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = message.get("content", "")
+            if role == "system":
+                text = str(content).strip()
+                if text:
+                    instructions.append(text)
+                continue
+
+            blocks = []
+            if isinstance(content, str):
+                block_type = "output_text" if role == "assistant" else "input_text"
+                blocks.append({"type": block_type, "text": content})
+            elif isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("type") == "text":
+                        block_type = "output_text" if role == "assistant" else "input_text"
+                        blocks.append({"type": block_type, "text": str(item.get("text", ""))})
+                    elif item.get("type") == "image_url":
+                        image_value = item.get("image_url", {})
+                        image_url = image_value.get("url", "") if isinstance(image_value, dict) else str(image_value)
+                        if image_url:
+                            blocks.append({"type": "input_image", "image_url": image_url})
+            if blocks:
+                converted.append({"role": role, "content": blocks})
+        return "\n\n".join(instructions), converted
     
     def select_best_preset(self, user_input: str, available_presets: list) -> str:
         """
@@ -148,18 +335,12 @@ class AIChatManager:
 请从上述列表中选择最适合回复用户输入的一个预设。
 直接返回预设文件名（如 "hello"），不要加任何解释。"""
             
-            response = self.client.chat.completions.create(
-                model=self.current_model,
-                messages=[
-                    {"role": "system", "content": self.PRESET_SELECTOR_PROMPT},
-                    {"role": "user", "content": selection_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=20,
-                extra_body={"thinking": {"type": "disabled"}}
-            )
-            
-            selected = response.choices[0].message.content.strip().lower()
+            selected = self.complete_text(
+                self.PRESET_SELECTOR_PROMPT,
+                [{"role": "user", "content": selection_prompt}],
+                20,
+                0.3,
+            ).lower()
             
             # 清理可能的额外字符
             selected = selected.replace('"', '').replace("'", "").replace(".", "").replace(",", "").strip()
@@ -183,39 +364,21 @@ class AIChatManager:
         """
         try:
             # 添加用户输入到历史
-            self.conversation_history.append({"role": "user", "content": user_input})
-            
-            # 构建消息
-            # 检查是否达到记忆极限（100轮对话 = 200条消息）
-            # 永久记忆功能开启时不显示记忆极限提示
-            if not self.permanent_memory and len(self.conversation_history) >= 200:  # 100轮 = 200条消息（用户+AI各100条）
-                return self._get_memory_limit_message()
-            
-            messages = [
-                {"role": "system", "content": self.SYSTEM_PROMPT}
-            ] + (self.conversation_history if self.permanent_memory else self.conversation_history[-100:])  # 永久记忆时使用全部历史，否则保留最近100轮对话
+            self.append_message("user", user_input)
+            messages = self.context_messages()
             
             # 调用API
             qsettings = get_qsettings()
             max_tokens = qsettings.value("max_tokens", 500, type=int)
             
-            response = self.client.chat.completions.create(
-                model=self.current_model,
-                messages=messages,
-                temperature=0.8,
-                max_tokens=max_tokens,
-                stream=True,
-                extra_body={"thinking": {"type": "disabled"}}
+            ai_response = "".join(
+                self.stream_text(self.SYSTEM_PROMPT, messages, max_tokens, 0.8)
             )
             
-            # 流式获取回复
-            ai_response = ""
-            for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    ai_response += chunk.choices[0].delta.content
-            
             # 添加到历史
-            self.conversation_history.append({"role": "assistant", "content": ai_response})
+            self.append_message("assistant", ai_response)
+            self.schedule_memory_compaction()
+            self.schedule_fact_extraction(user_input)
             
             # 分析情绪，返回建议的表情
             emotion = self._analyze_emotion(ai_response)
@@ -228,36 +391,27 @@ class AIChatManager:
     
     def save_conversation(self):
         try:
-            config_dir = get_config_dir()
-            history_file = config_dir / "conversation_history.json"
-            # 保存前先清洗内容，避免把图片 base64 或临时对象写进永久记忆
-            with open(history_file, 'w', encoding='utf-8') as f:
-                json.dump(sanitize_history_messages(self.conversation_history), f, ensure_ascii=False, indent=2)
-            print(f"对话历史已保存到: {history_file}")
+            with self._history_lock:
+                history = list(self.conversation_history)
+            self.memory.save_history(history)
+            print(f"对话历史已保存到: {self.memory.history_path}")
         except Exception as e:
             print(f"保存对话历史失败: {e}")
     
     def load_conversation(self):
         try:
-            config_dir = get_config_dir()
-            history_file = config_dir / "conversation_history.json"
-            if history_file.exists():
-                with open(history_file, 'r', encoding='utf-8') as f:
-                    self.conversation_history = sanitize_history_messages(json.load(f))
-                print(f"已加载 {len(self.conversation_history)} 条对话记录")
-            else:
-                print("对话历史文件不存在，使用空历史")
+            with self._history_lock:
+                self.conversation_history = self.memory.load_history()
+            print(f"已加载 {len(self.conversation_history)} 条对话记录")
         except Exception as e:
             print(f"加载对话历史失败: {e}")
             self.conversation_history = []
     
     def clear_conversation(self):
         try:
-            self.conversation_history = []
-            config_dir = get_config_dir()
-            history_file = config_dir / "conversation_history.json"
-            if history_file.exists():
-                history_file.unlink()
+            with self._history_lock:
+                self.conversation_history = []
+            self.memory.clear()
             print("对话历史已清除")
         except Exception as e:
             print(f"清除对话历史失败: {e}")
@@ -329,33 +483,18 @@ class AIChatManager:
 
             # 添加用户输入到历史
             history_user_content = format_image_history_text(user_input, image_path) if image_path else user_input
-            self.conversation_history.append({"role": "user", "content": history_user_content})
-
-            # 检查是否达到记忆极限（100轮对话 = 200条消息）
-            if not self.permanent_memory and len(self.conversation_history) >= 200:
-                message, emotion = self._get_memory_limit_message()
-                yield emotion, message
-                return
+            self.append_message("user", history_user_content)
 
             # 调用流式API
-            history_messages = self.conversation_history if self.permanent_memory else self.conversation_history[-100:]
-            messages = [
-                {"role": "system", "content": self.BILINGUAL_GENERATION_PROMPT}
-            ] + history_messages  # 永久记忆时使用全部历史，否则保留最近100轮对话
-            if image_path and messages:
-                messages[-1] = {"role": "user", "content": user_content}
+            messages = self.context_messages()
+            if image_path:
+                for index in range(len(messages) - 1, -1, -1):
+                    if messages[index].get("role") == "user":
+                        messages[index] = {"role": "user", "content": user_content}
+                        break
 
             qsettings = get_qsettings()
             max_tokens = qsettings.value("max_tokens", 500, type=int)
-
-            response = self.client.chat.completions.create(
-                model=self.current_model,
-                messages=messages,
-                temperature=0.8,
-                max_tokens=max_tokens,
-                stream=True,
-                extra_body={"thinking": {"type": "disabled"}}
-            )
 
             full_text = ""
             emotion = "normal"
@@ -363,9 +502,13 @@ class AIChatManager:
             japanese_emitted = False
             last_chinese_length = 0  # 记录上次发射的中文文本长度
 
-            for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    content = chunk.choices[0].delta.content
+            for content in self.stream_text(
+                self.BILINGUAL_GENERATION_PROMPT,
+                messages,
+                max_tokens,
+                0.8,
+            ):
+                if content:
                     full_text += content
 
                     # 提取表情标签（支持多个表情标签）
@@ -465,7 +608,9 @@ class AIChatManager:
                 self._translate_to_japanese,
                 self._translate_to_chinese,
             )
-            self.conversation_history.append({"role": "assistant", "content": parsed.history_text})
+            self.append_message("assistant", parsed.history_text)
+            self.schedule_memory_compaction()
+            self.schedule_fact_extraction(user_input)
 
         except Exception as e:
             print(f"AI API流式调用错误: {e}")
@@ -478,35 +623,17 @@ class AIChatManager:
         """
         try:
             # 添加用户输入到历史
-            self.conversation_history.append({"role": "user", "content": user_input})
-
-            # 检查是否达到记忆极限
-            if len(self.conversation_history) >= 200:
-                message, emotion = self._get_memory_limit_message()
-                return emotion, message, message
+            self.append_message("user", user_input)
 
             # 调用API生成双语回复（流式传输 + 禁用思考模式）
-            messages = [
-                {"role": "system", "content": self.BILINGUAL_GENERATION_PROMPT}
-            ] + (self.conversation_history if self.permanent_memory else self.conversation_history[-100:])  # 永久记忆时使用全部历史，否则保留最近100轮对话
+            messages = self.context_messages()
 
             qsettings = get_qsettings()
             max_tokens = qsettings.value("max_tokens", 500, type=int)
 
-            response = self.client.chat.completions.create(
-                model=self.current_model,
-                messages=messages,
-                temperature=0.8,
-                max_tokens=max_tokens,
-                stream=True,
-                extra_body={"thinking": {"type": "disabled"}}
+            content = "".join(
+                self.stream_text(self.BILINGUAL_GENERATION_PROMPT, messages, max_tokens, 0.8)
             )
-
-            # 流式收集完整内容
-            content = ""
-            for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    content += chunk.choices[0].delta.content
 
             parsed = parse_bilingual_response(
                 content,
@@ -515,7 +642,9 @@ class AIChatManager:
             )
 
             # 添加到历史
-            self.conversation_history.append({"role": "assistant", "content": parsed.history_text})
+            self.append_message("assistant", parsed.history_text)
+            self.schedule_memory_compaction()
+            self.schedule_fact_extraction(user_input)
 
             return parsed.emotion, parsed.chinese_text, parsed.japanese_text
 
@@ -526,22 +655,12 @@ class AIChatManager:
     def _translate_to_japanese(self, chinese_text: str) -> str:
         """将中文翻译为日语（调用模型 API）"""
         try:
-            response = self.client.chat.completions.create(
-                model=self.current_model,
-                messages=[
-                    {"role": "system", "content": self.JAPANESE_TRANSLATION_PROMPT},
-                    {"role": "user", "content": chinese_text}
-                ],
-                temperature=0.7,
-                max_tokens=500,
-                stream=True,
-                extra_body={"thinking": {"type": "disabled"}}
+            return self.complete_text(
+                self.JAPANESE_TRANSLATION_PROMPT,
+                [{"role": "user", "content": chinese_text}],
+                500,
+                0.7,
             )
-            result = ""
-            for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    result += chunk.choices[0].delta.content
-            return result.strip()
         except Exception as e:
             print(f"翻译错误: {e}")
             return ""
@@ -549,22 +668,12 @@ class AIChatManager:
     def _translate_to_chinese(self, japanese_text: str) -> str:
         """将日语翻译为中文（调用模型 API）"""
         try:
-            response = self.client.chat.completions.create(
-                model=self.current_model,
-                messages=[
-                    {"role": "system", "content": "你是一个专业的日语翻译，将日语翻译成自然流畅的中文。"},
-                    {"role": "user", "content": japanese_text}
-                ],
-                temperature=0.7,
-                max_tokens=500,
-                stream=True,
-                extra_body={"thinking": {"type": "disabled"}}
+            return self.complete_text(
+                "你是一个专业的日语翻译，将日语翻译成自然流畅的中文。",
+                [{"role": "user", "content": japanese_text}],
+                500,
+                0.7,
             )
-            result = ""
-            for chunk in response:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    result += chunk.choices[0].delta.content
-            return result.strip()
         except Exception as e:
             print(f"翻译错误: {e}")
             return ""

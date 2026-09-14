@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import requests
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -25,12 +25,44 @@ from core.app_config import (
     DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_MODEL,
     DEFAULT_PRESET_AUDIO_PROBABILITY,
+    DEFAULT_RESPONSES_BASE_URL,
+    DEFAULT_RESPONSES_MODEL,
     DEFAULT_VOCU_ASYNC_MODE,
     DEFAULT_VOCU_FLASH_MODE,
+    DEFAULT_VOCU_REALTIME_MODE,
     LEGACY_MODEL_MAP,
     MODEL_OPTIONS,
+    RESPONSES_PROVIDER_TYPE,
 )
-from core.resources import get_qsettings
+from core.resources import get_config_dir, get_qsettings
+from services.conversation_memory import ConversationMemory
+from ui.memory_facts_dialog import MemoryFactsDialog
+
+
+class CreditFetchWorker(QThread):
+    """在后台查询 Vocu 点数，避免设置窗口卡顿。"""
+
+    completed = pyqtSignal(bool, str)
+
+    def __init__(self, api_key: str, parent=None):
+        super().__init__(parent)
+        self.api_key = api_key
+
+    def run(self):
+        try:
+            response = requests.get(
+                "https://v1.vocu.studio/api/account/info",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=(5, 10),
+            )
+            data = response.json()
+            if response.ok and data.get("status") == 200:
+                credits = data.get("user", {}).get("credits", data.get("data", {}).get("credits", 0))
+                self.completed.emit(True, str(credits))
+                return
+        except (requests.RequestException, ValueError):
+            pass
+        self.completed.emit(False, "")
 
 
 class SettingsDialog(QDialog):
@@ -116,19 +148,24 @@ class SettingsDialog(QDialog):
         current_model_type = qsettings.value("model_type", "默认")
         if current_model_type == "自定义":
             current_model_type = "Ollama"
-        current_model = LEGACY_MODEL_MAP.get(qsettings.value("model", DEFAULT_MODEL), DEFAULT_MODEL)
+        saved_model = qsettings.value("model", DEFAULT_MODEL)
+        current_model = LEGACY_MODEL_MAP.get(saved_model, saved_model)
         current_custom_url = qsettings.value("custom_model_url", "http://localhost:11434")
         current_custom_name = qsettings.value("custom_model_name", "")
         current_deepseek_api_key = qsettings.value("deepseek_api_key", "")
         current_deepseek_model = qsettings.value("deepseek_model", DEFAULT_DEEPSEEK_MODEL)
         if current_deepseek_model not in DEEPSEEK_MODEL_OPTIONS:
             current_deepseek_model = DEFAULT_DEEPSEEK_MODEL
+        current_responses_url = qsettings.value("responses_base_url", DEFAULT_RESPONSES_BASE_URL)
+        current_responses_key = qsettings.value("responses_api_key", "")
+        current_responses_model = qsettings.value("responses_model", DEFAULT_RESPONSES_MODEL)
         preset_probability = max(
             0,
             min(100, qsettings.value("preset_audio_probability", DEFAULT_PRESET_AUDIO_PROBABILITY, type=int)),
         )
         permanent_memory = qsettings.value("permanent_memory", False, type=bool)
         vocu_async_mode = qsettings.value("vocu_async_mode", DEFAULT_VOCU_ASYNC_MODE, type=bool)
+        vocu_realtime_mode = qsettings.value("vocu_realtime_mode", DEFAULT_VOCU_REALTIME_MODE, type=bool)
         vocu_flash_mode = qsettings.value("vocu_flash_mode", DEFAULT_VOCU_FLASH_MODE, type=bool)
 
         root_layout = QVBoxLayout(self)
@@ -151,9 +188,11 @@ class SettingsDialog(QDialog):
         model_layout.setVerticalSpacing(8)
 
         self.model_type_combo = QComboBox()
-        self.model_type_combo.addItems(["默认", "Ollama", "Deepseek"])
+        self.model_type_combo.addItems([RESPONSES_PROVIDER_TYPE, "默认", "Ollama", "Deepseek"])
         self.model_type_combo.setCurrentText(
-            current_model_type if current_model_type in ["默认", "Ollama", "Deepseek"] else "默认"
+            current_model_type
+            if current_model_type in [RESPONSES_PROVIDER_TYPE, "默认", "Ollama", "Deepseek"]
+            else "默认"
         )
         model_layout.addWidget(QLabel("模型类型:"), 0, 0)
         model_layout.addWidget(self.model_type_combo, 0, 1)
@@ -190,6 +229,23 @@ class SettingsDialog(QDialog):
         self.deepseek_model_label = QLabel("Deepseek 模型:")
         model_layout.addWidget(self.deepseek_model_label, 5, 0)
         model_layout.addWidget(self.deepseek_model_combo, 5, 1)
+
+        self.responses_url_label = QLabel("Responses API URL:")
+        self.responses_url_input = QLineEdit(current_responses_url)
+        self.responses_url_input.setPlaceholderText("https://example.com/v1")
+        model_layout.addWidget(self.responses_url_label, 6, 0)
+        model_layout.addWidget(self.responses_url_input, 6, 1)
+
+        self.responses_key_label = QLabel("Responses API 密钥:")
+        self.responses_key_input = QLineEdit(current_responses_key)
+        self.responses_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        model_layout.addWidget(self.responses_key_label, 7, 0)
+        model_layout.addWidget(self.responses_key_input, 7, 1)
+
+        self.responses_model_label = QLabel("Responses 模型:")
+        self.responses_model_input = QLineEdit(current_responses_model)
+        model_layout.addWidget(self.responses_model_label, 8, 0)
+        model_layout.addWidget(self.responses_model_input, 8, 1)
         layout.addLayout(model_layout)
 
         self.api_key_label = QLabel("AI API 密钥:")
@@ -239,14 +295,21 @@ class SettingsDialog(QDialog):
         preset_row.addWidget(self.preset_probability_value)
         layout.addLayout(preset_row)
 
-        self.permanent_memory_checkbox = QCheckBox("启用永久记忆（实验性）")
+        self.permanent_memory_checkbox = QCheckBox("启用分层长期记忆")
         self.permanent_memory_checkbox.setChecked(permanent_memory)
         layout.addWidget(self.permanent_memory_checkbox)
 
-        memory_info = QLabel("开启后会保留聊天记录；关闭时会按主流程清理历史并重启。")
+        memory_info = QLabel(
+            "完整记录保存在本地；模型只接收重要事实、滚动摘要和近期原文。"
+            "可说“请记住…”或“忘掉…”，也可在下方手动管理。"
+        )
         memory_info.setStyleSheet("color: #AAAAAA; font-size: 12px;")
         memory_info.setWordWrap(True)
         layout.addWidget(memory_info)
+
+        self.manage_memory_button = QPushButton("管理重要记忆…")
+        self.manage_memory_button.clicked.connect(self._open_memory_facts)
+        layout.addWidget(self.manage_memory_button)
 
         vocu_layout = QGridLayout()
         vocu_layout.setColumnStretch(1, 1)
@@ -267,9 +330,13 @@ class SettingsDialog(QDialog):
         vocu_layout.addWidget(self.vocu_voice_id_input, 1, 1)
         layout.addLayout(vocu_layout)
 
-        self.vocu_async_checkbox = QCheckBox("启用 Vocu 异步生成（可能更快，但需要vocu的会员权限）")
+        self.vocu_async_checkbox = QCheckBox("启用 Vocu 异步任务回退（通常更慢，且可能需要会员权限）")
         self.vocu_async_checkbox.setChecked(vocu_async_mode)
         layout.addWidget(self.vocu_async_checkbox)
+
+        self.vocu_realtime_checkbox = QCheckBox("实时流优先（推荐，更早开始播放，失败自动回退）")
+        self.vocu_realtime_checkbox.setChecked(vocu_realtime_mode)
+        layout.addWidget(self.vocu_realtime_checkbox)
 
         self.vocu_flash_checkbox = QCheckBox("启用 Vocu Flash 低延迟模式（可能更快，但音色不稳定易漂移，效果不好，建议别开）")
         self.vocu_flash_checkbox.setChecked(vocu_flash_mode)
@@ -323,6 +390,7 @@ class SettingsDialog(QDialog):
         is_default = model_type == "默认"
         is_ollama = model_type == "Ollama"
         is_deepseek = model_type == "Deepseek"
+        is_responses = model_type == RESPONSES_PROVIDER_TYPE
 
         self.model_label.setVisible(is_default)
         self.model_combo.setVisible(is_default)
@@ -336,6 +404,23 @@ class SettingsDialog(QDialog):
         self.deepseek_model_combo.setVisible(is_deepseek)
         self.api_key_label.setVisible(is_default)
         self.api_key_input.setVisible(is_default)
+        for widget in (
+            self.responses_url_label,
+            self.responses_url_input,
+            self.responses_key_label,
+            self.responses_key_input,
+            self.responses_model_label,
+            self.responses_model_input,
+        ):
+            widget.setVisible(is_responses)
+
+    def _open_memory_facts(self):
+        parent = self.parentWidget()
+        chat = getattr(parent, "chat", None)
+        manager = getattr(chat, "ai_manager", None)
+        memory = getattr(manager, "memory", None) or ConversationMemory(get_config_dir())
+        dialog = MemoryFactsDialog(memory, self)
+        dialog.exec()
 
     def _update_audio_visibility(self):
         is_audio_enabled = self.audio_mode_checkbox.isChecked()
@@ -345,6 +430,7 @@ class SettingsDialog(QDialog):
             self.vocu_voice_label,
             self.vocu_voice_id_input,
             self.vocu_async_checkbox,
+            self.vocu_realtime_checkbox,
             self.vocu_flash_checkbox,
             self.credits_label,
             self.refresh_credits_btn,
@@ -398,25 +484,20 @@ class SettingsDialog(QDialog):
             self.credits_label.setStyleSheet("color: #FFD700; font-size: 13px;")
             return
 
-        try:
-            response = requests.get(
-                "https://v1.vocu.studio/api/account/info",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                timeout=10,
-                verify=False,
-            )
-            data = response.json()
-            if data.get("status") == 200:
-                credits = data.get("user", {}).get("credits", 0)
-                self.credits_label.setText(f"点数: {credits}")
-                self.credits_label.setStyleSheet("color: #00FF88; font-size: 13px;")
-            else:
-                self.credits_label.setText("点数: 查询失败")
-                self.credits_label.setStyleSheet("color: #FF6347; font-size: 13px;")
-        except Exception:
+        if hasattr(self, "_credits_worker") and self._credits_worker.isRunning():
+            return
+        self.refresh_credits_btn.setEnabled(False)
+        self.credits_label.setText("点数: 查询中…")
+        self._credits_worker = CreditFetchWorker(api_key, self)
+        self._credits_worker.completed.connect(self._on_credits_ready)
+        self._credits_worker.finished.connect(lambda: self.refresh_credits_btn.setEnabled(True))
+        self._credits_worker.start()
+
+    def _on_credits_ready(self, success: bool, credits: str):
+        if success:
+            self.credits_label.setText(f"点数: {credits}")
+            self.credits_label.setStyleSheet("color: #00FF88; font-size: 13px;")
+        else:
             self.credits_label.setText("点数: 查询失败")
             self.credits_label.setStyleSheet("color: #FF6347; font-size: 13px;")
 
@@ -429,10 +510,14 @@ class SettingsDialog(QDialog):
             "custom_model_name": self.custom_model_name.text().strip(),
             "deepseek_api_key": self.deepseek_api_key_input.text().strip(),
             "deepseek_model": self.deepseek_model_combo.currentText(),
+            "responses_base_url": self.responses_url_input.text().strip(),
+            "responses_api_key": self.responses_key_input.text().strip(),
+            "responses_model": self.responses_model_input.text().strip(),
             "vocu_api_key": self.vocu_api_key_input.text().strip(),
             "vocu_voice_id": self.vocu_voice_id_input.text().strip(),
             "audio_mode": self.audio_mode_checkbox.isChecked(),
             "vocu_async_mode": self.vocu_async_checkbox.isChecked(),
+            "vocu_realtime_mode": self.vocu_realtime_checkbox.isChecked(),
             "vocu_flash_mode": self.vocu_flash_checkbox.isChecked(),
             "preset_audio_probability": self.preset_probability_slider.value(),
             "permanent_memory": self.permanent_memory_checkbox.isChecked(),

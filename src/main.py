@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from core.version import APP_VERSION
 from ui.main_window import MainWindow
 from ui.splash_screen import SplashScreen
 from utils.debug_log import install_debug_logging
@@ -19,6 +20,7 @@ from utils.debug_log import install_debug_logging
 def main():
     install_debug_logging()
     app = QApplication(sys.argv)
+    app.setApplicationVersion(APP_VERSION)
     app.setStyle("Fusion")
 
     splash = SplashScreen()

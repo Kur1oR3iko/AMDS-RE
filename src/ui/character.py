@@ -20,7 +20,9 @@ class KurisuCharacter(QWidget):
         self.current_emotion = "normal"
         self.animation_frame = 0
         self.is_speaking = False
-        self.timer: QTimer | None = None
+        self.timer = QTimer(self)
+        self.timer.setInterval(150)
+        self.timer.timeout.connect(self.next_frame)
         self.setup_ui()
         self.update_image()
 
@@ -198,9 +200,7 @@ class KurisuCharacter(QWidget):
 
         self.is_speaking = True
         self.animation_frame = 0
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.next_frame)
-        self.timer.start(150)
+        self.timer.start()
         print("[动画] 定时器已启动，间隔150ms")
         self.update_image()
         print(f"[动画] 开始说话动画，当前表情: {self.current_emotion}, 帧: {self.animation_frame}")

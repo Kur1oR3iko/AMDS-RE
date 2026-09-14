@@ -4,22 +4,11 @@ Vocu AI 音频生成模块
 """
 import requests
 import time
-import ssl
-import urllib3
 from pathlib import Path
 from typing import Optional, Callable
+from requests.adapters import HTTPAdapter
 
 from core.resources import get_config_dir
-
-# 创建自定义 SSL 上下文
-ssl_context = ssl.create_default_context()
-ssl_context.set_ciphers('DEFAULT@SECLEVEL=1')  # 降低安全级别
-ssl_context.check_hostname = False
-ssl_context.verify_mode = ssl.CERT_NONE
-
-# 禁用 SSL 警告
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 
 class VocuAudioGenerator:
     """Vocu AI 音频生成器 - 异步版本"""
@@ -39,11 +28,43 @@ class VocuAudioGenerator:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         }
-        # 创建会话并配置 SSL
+        # 复用 TLS 连接，减少连续对话时的握手延迟。
         self.session = requests.Session()
-        self.session.verify = False
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=0)
+        self.session.mount("https://", adapter)
+        self.session.headers.update(self.headers)
+        # 播放地址位于独立域名；单独复用连接，避免每个分段重新做 TLS 握手。
+        self.stream_session = requests.Session()
+        self.stream_session.mount(
+            "https://",
+            HTTPAdapter(pool_connections=2, pool_maxsize=2, max_retries=0),
+        )
         self.cache_dir = get_config_dir() / "vocu_cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def warmup(self) -> bool:
+        """预建立 DNS/TLS 与 HTTP 连接，不生成音频、不消耗点数。"""
+        api_ready = False
+        try:
+            response = self.session.get(
+                "https://v1.vocu.studio/api/account/info",
+                timeout=(5, 10),
+            )
+            api_ready = response.ok
+        except requests.RequestException:
+            pass
+
+        try:
+            # 根路径即使返回 404，也已经完成 DNS/TLS 并可复用连接。
+            response = self.stream_session.get(
+                "https://stream.x-vocu.net/",
+                stream=True,
+                timeout=(3, 5),
+            )
+            response.close()
+        except requests.RequestException:
+            pass
+        return api_ready
 
     def generate_audio(
         self,
@@ -54,6 +75,7 @@ class VocuAudioGenerator:
         speech_rate: float = 1.0,
         async_mode: bool = False,
         flash_mode: bool = False,
+        realtime_mode: bool = True,
         callback: Optional[Callable[[str], None]] = None
     ) -> Optional[str]:
         """
@@ -67,6 +89,7 @@ class VocuAudioGenerator:
             speech_rate: 语速 (0.5-2.0)
             async_mode: 启用Vocu异步/流式生成，可能需要会员权限
             flash_mode: 启用Vocu Flash低延迟模式（可能更快，但音色稳定性可能下降）
+            realtime_mode: 优先使用 simple-generate 的 streamUrl
             callback: 状态回调函数，接收状态字符串
 
         Returns:
@@ -79,7 +102,7 @@ class VocuAudioGenerator:
             return None
 
         # 低延迟模式优先走文档中的同步实时接口，避免异步创建任务后再轮询带来的额外延迟。
-        if async_mode:
+        if realtime_mode:
             if callback:
                 callback("尝试低延迟实时生成...")
             direct_result = self._simple_generate(
@@ -96,7 +119,7 @@ class VocuAudioGenerator:
                 if callback:
                     callback("实时音频已就绪")
                 return direct_audio
-            print("同步实时接口未返回可用音频，回退到异步任务接口")
+            print("实时接口未返回可用音频，回退到任务接口")
 
         # 1. 创建异步生成任务
         if callback:
@@ -261,7 +284,8 @@ class VocuAudioGenerator:
         # 验证 voice_id 格式（应该是UUID格式）
         import re
         uuid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
-        if not uuid_pattern.match(voice_id):
+        is_market_voice = voice_id.startswith("market:")
+        if not uuid_pattern.match(voice_id) and not is_market_voice:
             print(f"警告: voice_id '{voice_id}' 不是有效的UUID格式")
             print(f"UUID格式示例: 46cc9a76-acd7-4af7-a13a-f8b1408b1848")
             # 尝试继续发送请求，让API返回具体错误
@@ -284,7 +308,6 @@ class VocuAudioGenerator:
 
         try:
             print(f"发送生成请求到: {url}")
-            print(f"请求体: {payload}")
             print(f"Headers: Authorization: Bearer {'*' * 10}...")
 
             response = self.session.post(
@@ -292,13 +315,9 @@ class VocuAudioGenerator:
                 headers=self.headers,
                 json=payload,
                 timeout=120,
-                verify=False
             )
             print(f"响应状态码: {response.status_code}")
-            print(f"响应内容: {response.text[:2000] if len(response.text) > 2000 else response.text}")
-
             data = response.json()
-            print(f"解析后的JSON: {data}")
 
             # 检查API错误
             if isinstance(data, dict):
@@ -351,17 +370,13 @@ class VocuAudioGenerator:
 
         try:
             print(f"发送实时生成请求到: {self.SIMPLE_API_URL}")
-            print(f"实时请求体: {payload}")
             response = self.session.post(
                 self.SIMPLE_API_URL,
                 headers=self.headers,
                 json=payload,
-                timeout=120,
-                verify=False,
+                timeout=(5, 30),
             )
             print(f"实时生成响应码: {response.status_code}")
-            body = response.text[:1200] if len(response.text) > 1200 else response.text
-            print(f"实时生成响应: {body}")
             data = response.json()
             return data if isinstance(data, dict) else None
         except Exception as exc:
@@ -382,11 +397,8 @@ class VocuAudioGenerator:
                 url,
                 headers=self.headers,
                 timeout=30,
-                verify=False
             )
             print(f"状态查询响应码: {response.status_code}")
-            print(f"状态查询响应: {response.text[:1000] if len(response.text) > 1000 else response.text}")
-            
             data = response.json()
 
             # 返回完整的响应数据
@@ -417,7 +429,7 @@ class VocuAudioGenerator:
             # 0. 同步实时接口直返字段
             stream_url = data.get("streamUrl")
             if stream_url:
-                print(f"找到流式URL (data.streamUrl): {stream_url}")
+                print("找到流式URL (data.streamUrl)")
                 return stream_url
             
             # 1. 检查 data.metadata.audio (合并的音频)
@@ -426,7 +438,7 @@ class VocuAudioGenerator:
                 # 合并的音频URL
                 audio_url = metadata.get("audio")
                 if audio_url:
-                    print(f"找到音频URL (data.metadata.audio): {audio_url}")
+                    print("找到音频URL (data.metadata.audio)")
                     return audio_url
                 
                 # 单个内容的音频URL
@@ -436,13 +448,13 @@ class VocuAudioGenerator:
                     if isinstance(first_content, dict):
                         audio_url = first_content.get("audio")
                         if audio_url:
-                            print(f"找到音频URL (data.metadata.contents[0].audio): {audio_url}")
+                            print("找到音频URL (data.metadata.contents[0].audio)")
                             return audio_url
             
             # 2. 直接在data中查找audio字段
             audio_url = data.get("audio")
             if audio_url:
-                print(f"找到音频URL (data.audio): {audio_url}")
+                print("找到音频URL (data.audio)")
                 return audio_url
 
             print(f"未找到音频URL")
@@ -466,13 +478,13 @@ class VocuAudioGenerator:
         audio_url = data.get("audio")
 
         if prefer_stream and stream_url:
-            print(f"实时接口返回 streamUrl: {stream_url}")
+            print("实时接口返回 streamUrl")
             return stream_url
         if audio_url:
-            print(f"实时接口返回 audio: {audio_url}")
+            print("实时接口返回 audio")
             return audio_url
         if stream_url:
-            print(f"实时接口返回 streamUrl: {stream_url}")
+            print("实时接口返回 streamUrl")
             return stream_url
         return None
 
@@ -480,7 +492,7 @@ class VocuAudioGenerator:
         """下载远程音频到本地缓存，减少远程流首播延迟。"""
         try:
             target = self.cache_dir / f"vocu_{int(time.time() * 1000)}{suffix}"
-            response = self.session.get(audio_url, timeout=120, verify=False)
+            response = self.stream_session.get(audio_url, timeout=120)
             response.raise_for_status()
             target.write_bytes(response.content)
             print(f"音频已缓存到本地: {target}")

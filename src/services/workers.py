@@ -1,12 +1,65 @@
 """Qt worker threads for chat and typewriter effects."""
 
+import re
+import threading
+import time
+
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from core.app_config import DEFAULT_VOCU_ASYNC_MODE, DEFAULT_VOCU_FLASH_MODE
+from core.app_config import DEFAULT_VOCU_ASYNC_MODE, DEFAULT_VOCU_FLASH_MODE, DEFAULT_VOCU_REALTIME_MODE
 from core.reply_parser import format_image_history_text, parse_bilingual_response
 from services.ai_manager import AIChatManager
 from utils.image_utils import encode_image_data_url
 from utils.thread_pool import submit_io
+
+
+def split_initial_tts_segment(text: str) -> tuple[str, str]:
+    """取出第一个自然日语句子；较长句子也可在读点处分段。"""
+    cleaned = (text or "").lstrip()
+    while cleaned.startswith("["):
+        closing = cleaned.find("]")
+        if closing < 0:
+            return "", ""
+        cleaned = cleaned[closing + 1:].lstrip()
+
+    sentence = re.search(r"[。！？!?]+[」』】）)]*", cleaned)
+    comma = re.search(r"[、，,]", cleaned)
+    boundary = sentence.end() if sentence else None
+    if comma and comma.end() >= 10 and (boundary is None or comma.end() < boundary):
+        boundary = comma.end()
+    if boundary is None:
+        return "", cleaned
+    return cleaned[:boundary].strip(), cleaned[boundary:].strip()
+
+
+def split_next_tts_segment(
+    text: str,
+    final: bool = False,
+    max_chars: int = 32,
+) -> tuple[str, str]:
+    """按自然句界取下一段；极长无标点文本限制为适合低延迟 TTS 的长度。"""
+    head, remainder = split_initial_tts_segment(text)
+    if head and len(head) <= max_chars:
+        return head, remainder
+
+    cleaned = (text or "").strip()
+    if head:
+        cleaned = head
+    elif len(cleaned) < max_chars and not final:
+        return "", cleaned
+    elif len(cleaned) <= max_chars:
+        return cleaned, ""
+
+    boundary = max_chars
+    for marker in ("、", "，", ","):
+        candidate = cleaned.rfind(marker, max_chars // 2, max_chars)
+        if candidate >= max_chars // 2:
+            boundary = max(boundary if boundary < max_chars else 0, candidate + 1)
+    segment = cleaned[:boundary].strip()
+    tail = cleaned[boundary:].strip()
+    if head:
+        tail = f"{tail}{remainder}".strip()
+    return segment, tail
 
 class ChatWorker(QThread):
     """AI对话工作线程 - 流式传输文本并解析表情标签，支持图片和音频生成"""
@@ -21,7 +74,8 @@ class ChatWorker(QThread):
     def __init__(self, ai_manager: AIChatManager, user_input: str, image_path: str = None,
                  audio_generator=None, voice_id: str = None, enable_audio: bool = False,
                  max_tokens: int = 200, vocu_async_mode: bool = DEFAULT_VOCU_ASYNC_MODE,
-                 vocu_flash_mode: bool = DEFAULT_VOCU_FLASH_MODE):
+                 vocu_flash_mode: bool = DEFAULT_VOCU_FLASH_MODE,
+                 vocu_realtime_mode: bool = DEFAULT_VOCU_REALTIME_MODE):
         super().__init__()
         self.ai_manager = ai_manager
         self.user_input = user_input
@@ -32,20 +86,21 @@ class ChatWorker(QThread):
         self.max_tokens = max_tokens
         self.vocu_async_mode = vocu_async_mode
         self.vocu_flash_mode = vocu_flash_mode
+        self.vocu_realtime_mode = vocu_realtime_mode
         self._is_running = True
         self._start_time = None
+        self._audio_futures = []
 
     def run(self):
         try:
-            import time
-            self._start_time = time.time()
+            self._start_time = time.perf_counter()
             
             # 判断是否使用音频模式（即使有图片也使用音频模式）
             # 只有三项都就绪时才走音频分支：开关、生成器和声音 ID
             use_audio_mode = self.enable_audio and self.audio_generator and self.voice_id
             
             if use_audio_mode:
-                # 优化流程：先生成文本和音频，准备好后同步显示
+                # 音频模式仍保持模型流式输出，文本和 TTS 各自尽早推进。
                 self.audio_status.emit("生成回复...")
                 
                 # 处理用户输入（支持图片）
@@ -68,56 +123,184 @@ class ChatWorker(QThread):
 
                 # 添加用户输入到历史
                 history_user_content = format_image_history_text(self.user_input, self.image_path) if self.image_path else self.user_input
-                self.ai_manager.conversation_history.append({"role": "user", "content": history_user_content})
-
-                # 检查记忆极限
-                # 永久记忆功能开启时不显示记忆极限提示
-                if not self.ai_manager.permanent_memory and len(self.ai_manager.conversation_history) >= 200:
-                    message, emotion = self.ai_manager._get_memory_limit_message()
-                    self.emotion_ready.emit(emotion)
-                    for char in message:
-                        if not self._is_running:
-                            break
-                        self.chunk_ready.emit(char)
-                        self.msleep(30)
-                    self.response_complete.emit(message, emotion, "")
-                    return
+                self.ai_manager.append_message("user", history_user_content)
 
                 # 流式生成双语回复
-                history_messages = self.ai_manager.conversation_history if self.ai_manager.permanent_memory else self.ai_manager.conversation_history[-100:]
-                messages = [
-                    {"role": "system", "content": self.ai_manager.BILINGUAL_GENERATION_PROMPT}
-                ] + history_messages  # 永久记忆时使用全部历史，否则保留最近100轮对话
-                if self.image_path and messages:
-                    messages[-1] = {"role": "user", "content": user_content}
+                messages = self.ai_manager.context_messages()
+                if self.image_path:
+                    for index in range(len(messages) - 1, -1, -1):
+                        if messages[index].get("role") == "user":
+                            messages[index] = {"role": "user", "content": user_content}
+                            break
 
-                response = self.ai_manager.client.chat.completions.create(
-                    model=self.ai_manager.current_model,
-                    messages=messages,
-                    temperature=0.8,
-                    max_tokens=self.max_tokens,
-                    stream=True,
-                    extra_body={"thinking": {"type": "disabled"}}
-                )
+                audio_segment_count = 0
+                audio_results: dict[int, str | None] = {}
+                audio_results_lock = threading.Lock()
+                next_audio_to_emit = 1
+                audio_protocol_closed = False
+                audio_emotion_emitted = False
+                japanese_emitted = False
+                first_delta_logged = False
+                streamed_chinese_text = ""
+                observed_japanese_text = ""
+                pending_japanese_text = ""
+                audio_generation_slots = threading.BoundedSemaphore(2)
+
+                def generate_audio_segment(segment_index: int, japanese_text: str):
+                    nonlocal next_audio_to_emit
+                    segment_started = time.perf_counter()
+                    audio_url = None
+                    try:
+                        with audio_generation_slots:
+                            if not self._is_running:
+                                return
+                            print(f"[音频生成] 开始生成第 {segment_index} 段")
+                            audio_url = self.audio_generator.generate_audio(
+                                text=japanese_text,
+                                voice_id=self.voice_id,
+                                language="ja",
+                                async_mode=self.vocu_async_mode,
+                                flash_mode=self.vocu_flash_mode,
+                                realtime_mode=self.vocu_realtime_mode,
+                            )
+                        if audio_url:
+                            print(
+                                f"[音频生成] 第 {segment_index} 段播放地址已就绪，"
+                                f"耗时 {time.perf_counter() - segment_started:.2f} 秒"
+                            )
+                        else:
+                            self.audio_status.emit(f"第 {segment_index} 段音频生成失败")
+                    except Exception as exc:
+                        print(f"[音频生成] 第 {segment_index} 段异常: {exc}")
+                        self.audio_status.emit(f"第 {segment_index} 段音频生成失败")
+
+                    ready_urls = []
+                    with audio_results_lock:
+                        audio_results[segment_index] = audio_url
+                        while next_audio_to_emit in audio_results:
+                            ready = audio_results.pop(next_audio_to_emit)
+                            next_audio_to_emit += 1
+                            if ready:
+                                ready_urls.append(ready)
+                    if self._is_running:
+                        for ready in ready_urls:
+                            self.audio_ready.emit(ready)
+
+                def queue_audio_segment(japanese_text: str):
+                    nonlocal audio_segment_count
+                    normalized = (japanese_text or "").strip()
+                    if not normalized or not self._is_running:
+                        return
+                    audio_segment_count += 1
+                    print(
+                        f"[音频生成] 第 {audio_segment_count} 段已入队，"
+                        f"距请求开始 {time.perf_counter() - self._start_time:.2f} 秒"
+                    )
+                    future = submit_io(generate_audio_segment, audio_segment_count, normalized)
+                    self._audio_futures.append(future)
+
+                def queue_streamed_audio_segments(japanese_prefix: str, final: bool = False):
+                    nonlocal audio_protocol_closed, observed_japanese_text, pending_japanese_text
+                    if audio_protocol_closed:
+                        return
+                    cleaned = re.sub(r"\[[^\]]+\]", "", japanese_prefix or "").strip()
+                    if cleaned.startswith(observed_japanese_text):
+                        pending_japanese_text += cleaned[len(observed_japanese_text):]
+                        observed_japanese_text = cleaned
+                    elif not observed_japanese_text:
+                        pending_japanese_text = cleaned
+                        observed_japanese_text = cleaned
+                    else:
+                        # Responses 流通常只追加；前缀异常改写时等最终解析结果兜底。
+                        if final:
+                            pending_japanese_text = cleaned
+                            observed_japanese_text = cleaned
+                        else:
+                            return
+
+                    while pending_japanese_text:
+                        segment, remainder = split_next_tts_segment(
+                            pending_japanese_text,
+                            final=final,
+                        )
+                        if not segment:
+                            break
+                        queue_audio_segment(segment)
+                        pending_japanese_text = remainder
+                    if final:
+                        audio_protocol_closed = True
+
+                def emit_chinese_progress(chinese_text: str):
+                    nonlocal streamed_chinese_text
+                    candidate = (chinese_text or "").strip()
+                    if not candidate:
+                        return
+                    if candidate.startswith(streamed_chinese_text):
+                        delta = candidate[len(streamed_chinese_text):]
+                    elif not streamed_chinese_text:
+                        delta = candidate
+                    else:
+                        # 模型输出是追加式的；若提供商改写了已输出前缀，避免重复显示。
+                        return
+                    if delta:
+                        self.chunk_ready.emit(delta)
+                        streamed_chinese_text = candidate
 
                 # 流式收集完整内容
                 full_content = ""
-                for chunk in response:
+                audio_generation_prompt = self.ai_manager.BILINGUAL_GENERATION_PROMPT + """
+
+语音低延迟附加要求：日语部分优先用一个自然、承载实际语义的短句开场，
+建议约 6～14 个日文字符并以「。」「！」「？」结束，然后再继续完整回答。
+不要为了短句添加与用户问题无关的寒暄；仍然只能使用一个半角竖线分隔完整日语和中文。"""
+                for content in self.ai_manager.stream_text(
+                    audio_generation_prompt,
+                    messages,
+                    self.max_tokens,
+                    0.8,
+                ):
                     if not self._is_running:
                         break
                     # 检查超时
-                    if time.time() - self._start_time > 20:
+                    if time.perf_counter() - self._start_time > 90:
                         self.error_occurred.emit("timeout")
                         return
-                    if chunk.choices and chunk.choices[0].delta.content:
-                        full_content += chunk.choices[0].delta.content
+                    if not first_delta_logged:
+                        first_delta_logged = True
+                        print(
+                            "[音频延迟] 模型首个文本块到达，"
+                            f"耗时 {time.perf_counter() - self._start_time:.2f} 秒"
+                        )
+                    full_content += content
+
+                    # 每个完整自然句一出现就合成；长回复可继续形成第 3、4 段。
+                    # 合成端最多同时提交两条，播放端严格顺序并只预连接下一条。
+                    if not audio_protocol_closed:
+                        japanese_prefix, separator, _ = full_content.partition("|")
+                        queue_streamed_audio_segments(japanese_prefix, final=bool(separator))
+                        if audio_segment_count and not audio_emotion_emitted:
+                            partial = parse_bilingual_response(japanese_prefix, None, None)
+                            self.emotion_ready.emit(partial.emotion)
+                            audio_emotion_emitted = True
+                        if separator:
+                            partial = parse_bilingual_response(full_content, None, None)
+                            if partial.japanese_text and not japanese_emitted:
+                                self.japanese_text_ready.emit(partial.japanese_text)
+                                japanese_emitted = True
+                            emit_chinese_progress(partial.chinese_text)
+
+                    if not japanese_emitted and "|" in full_content:
+                        partial = parse_bilingual_response(full_content, None, None)
+                        if partial.japanese_text:
+                            self.japanese_text_ready.emit(partial.japanese_text)
+                            japanese_emitted = True
 
                 if not self._is_running:
                     return
 
                 try:
                     # 统一解析 AI 的多段输出，避免表情、日文、中文分散在不同分支里
-                    print(f"[音频模式] 完整内容: {full_content}")
+                    print(f"[音频模式] 双语回复接收完成，共 {len(full_content)} 个字符")
                     parsed = parse_bilingual_response(
                         full_content,
                         self.ai_manager._translate_to_japanese,
@@ -126,7 +309,10 @@ class ChatWorker(QThread):
                     emotion = parsed.emotion
                     japanese_text = parsed.japanese_text
                     chinese_text = parsed.chinese_text
-                    print(f"[音频模式] 解析结果 - 表情: {emotion}, 日语: {japanese_text}, 中文: {chinese_text}")
+                    print(
+                        f"[音频模式] 解析完成 - 表情: {emotion}, "
+                        f"日语 {len(japanese_text)} 字符, 中文 {len(chinese_text)} 字符"
+                    )
                 except Exception as e:
                     print(f"解析响应失败: {e}")
                     import traceback
@@ -139,53 +325,21 @@ class ChatWorker(QThread):
                 # 发射表情
                 self.emotion_ready.emit(emotion)
 
-                # 先显示日语文本
-                self.japanese_text_ready.emit(japanese_text)
+                if not japanese_emitted:
+                    self.japanese_text_ready.emit(japanese_text)
+                if not audio_protocol_closed:
+                    queue_streamed_audio_segments(japanese_text, final=True)
 
-                # 在后台线程中生成音频，不阻塞中文文本显示
                 audio_path = None
-                if japanese_text and self._is_running:
-                    # 检查超时
-                    if time.time() - self._start_time > 20:
-                        self.error_occurred.emit("timeout")
-                        return
-                    
-                    def generate_audio_async():
-                        try:
-                            print(f"[音频生成] 开始生成音频")
-                            audio_url = self.audio_generator.generate_audio(
-                                text=japanese_text,
-                                voice_id=self.voice_id,
-                                language="ja",
-                                async_mode=self.vocu_async_mode,
-                                flash_mode=self.vocu_flash_mode
-                            )
-                            
-                            if audio_url:
-                                print(f"[音频生成] 获得音频URL: {audio_url}")
-                                # 保留远程流地址，优先交给专门的网络流播放器处理
-                                self.audio_ready.emit(audio_url)
-                            else:
-                                print(f"[音频生成] 音频URL为空")
-                                self.audio_status.emit("音频生成失败")
-                        except Exception as e:
-                            print(f"[音频生成] 异常: {e}")
-                            import traceback
-                            traceback.print_exc()
-                            self.audio_status.emit("音频生成失败")
-                    
-                    submit_io(generate_audio_async)
 
-                # 立即流式显示中文文本（不等待音频生成）
+                # 补发模型结束事件中尚未流出的尾部，绝不重复已显示文本。
                 if self._is_running:
-                    for char in chinese_text:
-                        if not self._is_running:
-                            break
-                        self.chunk_ready.emit(char)
-                        self.msleep(25)
+                    emit_chinese_progress(chinese_text)
 
                 # 添加到历史
-                self.ai_manager.conversation_history.append({"role": "assistant", "content": chinese_text})
+                self.ai_manager.append_message("assistant", chinese_text)
+                self.ai_manager.schedule_memory_compaction()
+                self.ai_manager.schedule_fact_extraction(self.user_input)
                 
                 self.response_complete.emit(chinese_text, emotion, audio_path or "")
 
@@ -199,7 +353,7 @@ class ChatWorker(QThread):
                     if not self._is_running:
                         break
                     # 检查超时
-                    if time.time() - self._start_time > 20:
+                    if time.perf_counter() - self._start_time > 20:
                         self.error_occurred.emit("timeout")
                         return
 
@@ -228,6 +382,8 @@ class ChatWorker(QThread):
 
     def stop(self):
         self._is_running = False
+        for future in self._audio_futures:
+            future.cancel()
 
 class TypewriterWorker(QThread):
     """打字机效果工作线程 - 用于预设回答"""
